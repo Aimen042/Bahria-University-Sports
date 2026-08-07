@@ -36,18 +36,25 @@ export default function AvailabilityScreen() {
   const [error, setError] = useState<string | null>(null);
   const [selectedSport, setSelectedSport] = useState<string | null>(null);
 
+  const userId = user?.userId ?? null;
+
   const loadInitial = useCallback(async () => {
     try {
       const [status, categories] = await Promise.all([listAvailability(), listSportCategories()]);
       setRows(status.status);
       setCats(categories.categories);
+      setError(null);
     } catch (e) {
       if (e instanceof ApiRequestError && e.status === 401) return;
       setError(e instanceof ApiRequestError ? e.body.error : 'Could not load availability.');
     }
   }, []);
 
-  useEffect(() => { void loadInitial(); }, [loadInitial]);
+  // Gate on userId so this never fires before auth refresh completes
+  useEffect(() => {
+    if (!userId) return;
+    void loadInitial();
+  }, [userId, loadInitial]);
 
   useEffect(() => {
     if (loading || !user) return;
