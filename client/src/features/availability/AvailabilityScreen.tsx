@@ -79,7 +79,7 @@ export default function AvailabilityScreen() {
   if (!user) return <Navigate to="/" replace />;
 
   const isStaff = user.role === 'SUPER_ADMIN' || user.role === 'COORDINATOR';
-  const isStudent = user.role === 'STUDENT';
+  const isClientRole = user.role === 'STUDENT' || user.role === 'EXTERNAL';
 
   // Sports that have at least one equipment type in the live data
   const availableSports = rows
@@ -100,8 +100,8 @@ export default function AvailabilityScreen() {
         {/* Header */}
         <div style={headerRow}>
           <p style={subtitle}>
-            {isStudent
-              ? 'Select a sport to see available equipment, then submit a borrow request.'
+            {isClientRole
+              ? 'Select a sport to see available equipment and check live availability.'
               : 'Live status per equipment type. Updates automatically.'}
           </p>
           <span style={{ ...liveDot, ...(live ? liveDotOn : undefined) }}>
@@ -111,8 +111,8 @@ export default function AvailabilityScreen() {
 
         {error && <div style={errBox}>{error}</div>}
 
-        {/* ══ STUDENT VIEW ══ */}
-        {isStudent && (
+        {/* ══ STUDENT + EXTERNAL VIEW ══ */}
+        {isClientRole && (
           <>
             {/* Sport cards */}
             <div style={sportGrid}>
@@ -132,7 +132,7 @@ export default function AvailabilityScreen() {
                           style={sportCard(isActive, anyAvailable)}
                           onClick={() => setSelectedSport(isActive ? null : b.label)}
                         >
-                          <span style={sportEmojiStyle}>{SPORT_EMOJI[b.label] ?? '🏅'}</span>
+                          <span style={{ fontSize: 28 }}>{SPORT_EMOJI[b.label] ?? '🏅'}</span>
                           <span style={sportLabel}>{b.label}</span>
                           <span style={sportSub}>
                             {anyAvailable
@@ -149,12 +149,19 @@ export default function AvailabilityScreen() {
               <div style={detailPanel}>
                 <div style={detailHead}>
                   <span>{SPORT_EMOJI[selectedBundle.label] ?? '🏅'} {selectedBundle.label} Equipment</span>
-                  <button
-                    style={borrowBtn}
-                    onClick={() => navigate('/my-borrows', { state: { sport: selectedBundle.label } })}
-                  >
-                    Request {selectedBundle.label} Equipment →
-                  </button>
+                  {user.role === 'STUDENT' && (
+                    <button
+                      style={borrowBtn}
+                      onClick={() => navigate('/my-borrows', { state: { sport: selectedBundle.label } })}
+                    >
+                      Request {selectedBundle.label} Equipment →
+                    </button>
+                  )}
+                  {user.role === 'EXTERNAL' && (
+                    <span style={{ fontSize: 12, color: '#5c6773', fontWeight: 400 }}>
+                      View only
+                    </span>
+                  )}
                 </div>
                 <table style={itemTable}>
                   <thead>
@@ -209,8 +216,8 @@ export default function AvailabilityScreen() {
           </>
         )}
 
-        {/* ══ STAFF VIEW (unchanged) ══ */}
-        {!isStudent && (
+        {/* ══ STAFF VIEW ══ */}
+        {isStaff && (
           <>
             <div style={filterRow}>
               <select style={select} value={sportCategoryId}
@@ -254,7 +261,7 @@ function EquipmentCard({ row, showTotal }: { row: AvailabilityRow; showTotal: bo
     <div style={card}>
       <div style={cardImageWrap}>
         {row.imageUrl
-          ? <img src={row.imageUrl} alt="" style={cardImage}
+          ? <img src={row.imageUrl} alt={row.name} style={cardImage}
               onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }} />
           : <div style={cardImagePlaceholder}>{row.name.charAt(0)}</div>}
       </div>
