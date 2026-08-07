@@ -162,7 +162,7 @@ export default function UsageHistoryScreen() {
               <label style={{ ...label, gridColumn: '1 / -1' }}>User ID (staff filter)
                 <input
                   type="text"
-                  placeholder="Paste a user UUID to scope results"
+                  placeholder="Paste a user ID to scope results"
                   value={actorUserId}
                   onChange={(e) => setActorUserId(e.target.value)}
                   style={input}
