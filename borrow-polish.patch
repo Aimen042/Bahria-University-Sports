@@ -1,0 +1,678 @@
+From fc1f0157b7609136239c2673614fac442fb3c0f8 Mon Sep 17 00:00:00 2001
+From: Raza <raza@bukc-sports.dev>
+Date: Wed, 29 Jul 2026 10:19:05 +0000
+Subject: [PATCH] =?UTF-8?q?feat(borrow):=20equipment=20borrowing=20polish?=
+ =?UTF-8?q?=20=E2=80=94=20product-page=20request,=20stock/bad-sport=20in?=
+ =?UTF-8?q?=20queue,=20max-duration,=20accurate=20errors?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Server:
+- submitRequest enforces max_borrow_duration_minutes with clear per-type message
+- approveRequest checks live stock BEFORE flipping to APPROVED (zero → 409)
+- mapDbError detects uq_one_open_borrow_request → accurate 'already have a pending' msg
+- listQueue returns available_units + is_bad_sport per queue row
+
+Client:
+- MyBorrowsScreen: product-page detail view when ?type= present (image, name,
+  sport, stock), compact picker fallback, start/return default to now/now+1h,
+  client-side max-duration validation, footer text removed
+- BorrowQueueScreen: Available column, Bad Sport pill, disable Approve at zero
+  stock with guidance banner
+- ProfileScreen: BAD SPORT banner in StudentActivity when threshold crossed
+- AdminAccountsScreen: debounced search bar on CoordinatorInviteLog
+
+Tests:
+- T-616: max-duration rejection
+- T-617: exact-max-duration acceptance
+- T-618: zero-stock approval block
+- T-619: accurate duplicate-pending constraint message
+- T-620: queue returns available_units + is_bad_sport fields
+---
+ .../src/features/auth/AdminAccountsScreen.tsx |  33 ++-
+ client/src/features/auth/ProfileScreen.tsx    |  16 +-
+ .../src/features/borrow/BorrowQueueScreen.tsx |  31 ++-
+ .../src/features/borrow/MyBorrowsScreen.tsx   | 193 +++++++++++++++---
+ client/src/features/borrow/api.ts             |   1 +
+ server/src/features/borrow/service.ts         |  50 ++++-
+ server/tests/borrow.test.ts                   |  84 ++++++++
+ 7 files changed, 358 insertions(+), 50 deletions(-)
+
+diff --git a/client/src/features/auth/AdminAccountsScreen.tsx b/client/src/features/auth/AdminAccountsScreen.tsx
+index 091e461..dd3dacd 100644
+--- a/client/src/features/auth/AdminAccountsScreen.tsx
++++ b/client/src/features/auth/AdminAccountsScreen.tsx
+@@ -589,6 +589,9 @@ function InviteCoordinator({ onDone, onError }: { onDone: (m: string) => void; o
+ // accepted, still pending, or expired unused.
+ function CoordinatorInviteLog({ onError }: { onError: (m: string) => void }) {
+   const [invites, setInvites] = useState<CoordinatorInviteRecord[] | null>(null);
++  const [searchTerm, setSearchTerm] = useState('');
++  const debouncedTerm = useDebouncedValue(searchTerm, 350);
++  const activeSearchTerm = debouncedTerm.trim().length >= MIN_SEARCH_CHARS ? debouncedTerm.trim() : '';
+ 
+   useEffect(() => {
+     (async () => {
+@@ -597,30 +600,44 @@ function CoordinatorInviteLog({ onError }: { onError: (m: string) => void }) {
+     })();
+   }, [onError]);
+ 
++  const filtered = invites?.filter((i) => {
++    if (!activeSearchTerm) return true;
++    const term = activeSearchTerm.toLowerCase();
++    return i.fullName.toLowerCase().includes(term)
++      || i.email.toLowerCase().includes(term)
++      || i.invitedByName.toLowerCase().includes(term);
++  }) ?? null;
++
+   return (
+     <Panel title="Coordinator Invitations Sent">
+-      {invites === null ? (
++      {invites !== null && invites.length > 0 && (
++        <div style={searchRow}>
++          <input style={searchInput} placeholder="Search by name or email…" value={searchTerm} onChange={(e) => setSearchTerm(e.target.value)} />
++        </div>
++      )}
++      {activeSearchTerm && filtered?.length === 0 && <p style={hintMuted}>No invitations match "{activeSearchTerm}".</p>}
++      {filtered === null ? (
+         <p style={muted}>Loading…</p>
+-      ) : invites.length === 0 ? (
++      ) : filtered.length === 0 && !activeSearchTerm ? (
+         <p style={muted}>No coordinator invitations have been sent yet.</p>
+-      ) : (
++      ) : filtered.length > 0 ? (
+         <table style={table}>
+           <thead>
+             <tr><th style={th}>Name</th><th style={th}>Email</th><th style={th}>Invited By</th><th style={th}>Sent</th><th style={th}>Status</th></tr>
+           </thead>
+           <tbody>
+-            {invites.map((i) => (
++            {filtered.map((i) => (
+               <tr key={i.inviteId}>
+-                <td style={td}>{i.fullName}</td>
+-                <td style={td}>{i.email}</td>
+-                <td style={td}>{i.invitedByName}</td>
++                <td style={td}><Highlight text={i.fullName} term={activeSearchTerm} /></td>
++                <td style={td}><Highlight text={i.email} term={activeSearchTerm} /></td>
++                <td style={td}><Highlight text={i.invitedByName} term={activeSearchTerm} /></td>
+                 <td style={td}>{new Date(i.issuedAt).toLocaleString()}</td>
+                 <td style={td}><span style={{ ...badge, ...inviteStatusStyle(i.status) }}>{i.status}</span></td>
+               </tr>
+             ))}
+           </tbody>
+         </table>
+-      )}
++      ) : null}
+     </Panel>
+   );
+ }
+diff --git a/client/src/features/auth/ProfileScreen.tsx b/client/src/features/auth/ProfileScreen.tsx
+index d728c76..4d49438 100644
+--- a/client/src/features/auth/ProfileScreen.tsx
++++ b/client/src/features/auth/ProfileScreen.tsx
+@@ -208,11 +208,16 @@ function StudentActivity({ userId, onError }: { userId: string; onError: (m: str
+   return (
+     <Panel title="Borrowing Activity" action={<button style={linkBtn} onClick={() => navigate('/my-borrows')}>Request Equipment →</button>}>
+       {rep && (
+-        <div style={statsRow}>
+-          <Stat label="Total borrows" value={rep.totalBorrows} />
+-          <Stat label="Late returns" value={rep.lateReturns} warn={rep.lateReturns > 0} />
+-          <Stat label="Damaged returns" value={rep.damagedReturns} warn={rep.damagedReturns > 0} />
+-        </div>
++        <>
++          {rep.isBadSport && (
++            <div style={badSportBanner}>⚠ BAD SPORT — You have {rep.lateReturns} late return{rep.lateReturns !== 1 ? 's' : ''}. Repeated late returns affect your borrowing standing.</div>
++          )}
++          <div style={statsRow}>
++            <Stat label="Total borrows" value={rep.totalBorrows} />
++            <Stat label="Late returns" value={rep.lateReturns} warn={rep.lateReturns > 0} />
++            <Stat label="Damaged returns" value={rep.damagedReturns} warn={rep.damagedReturns > 0} />
++          </div>
++        </>
+       )}
+       {requests === null ? (
+         <p style={muted}>Loading…</p>
+@@ -310,6 +315,7 @@ const detailValue: React.CSSProperties = { fontSize: 14, color: '#222' };
+ const linkBtn: React.CSSProperties = { background: 'none', border: 'none', font: '500 13px var(--font-body)', color: '#0a6ebd', cursor: 'pointer', padding: 0 };
+ const notifRow: React.CSSProperties = { padding: '10px 4px', borderBottom: '1px solid #f0f0f0', cursor: 'pointer' };
+ const notifRowUnread: React.CSSProperties = { background: '#f7fbff' };
++const badSportBanner: React.CSSProperties = { background: '#fef0ee', color: '#8f2323', border: '1px solid #f3caca', borderRadius: 4, padding: '10px 14px', marginBottom: 12, fontSize: 13.5, font: '600 13.5px var(--font-body)' };
+ const statsRow: React.CSSProperties = { display: 'flex', gap: 14, marginBottom: 8 };
+ const statBox: React.CSSProperties = { flex: 1, textAlign: 'center', padding: '10px 6px', background: '#f7f9fb', borderRadius: 6 };
+ const activityRow: React.CSSProperties = { display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px 4px', borderBottom: '1px solid #f0f0f0', fontSize: 13.5, color: '#333' };
+diff --git a/client/src/features/borrow/BorrowQueueScreen.tsx b/client/src/features/borrow/BorrowQueueScreen.tsx
+index 63a3b96..2dc8fce 100644
+--- a/client/src/features/borrow/BorrowQueueScreen.tsx
++++ b/client/src/features/borrow/BorrowQueueScreen.tsx
+@@ -48,12 +48,17 @@ export default function BorrowQueueScreen() {
+                 <p style={muted}>No pending requests.</p>
+               ) : (
+                 <table style={table}>
+-                  <thead><tr><th style={th}>Student</th><th style={th}>Equipment</th><th style={th}>Window</th><th style={th} /></tr></thead>
++                  <thead><tr><th style={th}>Student</th><th style={th}>Equipment</th><th style={th}>Available</th><th style={th}>Window</th><th style={th} /></tr></thead>
+                   <tbody>
+                     {queue.map((q) => (
+                       <tr key={q.borrow_request_id}>
+-                        <td style={td}>{q.student_name}<br /><span style={{ color: '#8a949f', fontSize: 12 }}>{q.student_email}</span></td>
++                        <td style={td}>
++                          {q.student_name}
++                          {q.is_bad_sport && <span style={badSportPill}>BAD SPORT</span>}
++                          <br /><span style={{ color: '#8a949f', fontSize: 12 }}>{q.student_email}</span>
++                        </td>
+                         <td style={td}>{q.equipment_type_name}</td>
++                        <td style={td}><span style={q.available_units > 0 ? stockOk : stockZero}>{q.available_units}</span></td>
+                         <td style={td}>{new Date(q.requested_start_at).toLocaleString()} → {new Date(q.requested_return_at).toLocaleTimeString()}</td>
+                         <td style={{ ...td, textAlign: 'right' }}>
+                           <button style={reviewBtn} onClick={() => setSelected(q)}>Review</button>
+@@ -96,17 +101,32 @@ function LendPanel({ item, onBack, onDone, onError }: {
+     catch (e) { onError(errMsg(e)); } finally { setBusy(false); }
+   }
+ 
++  const noStock = item.available_units === 0;
++
+   return (
+     <Panel title={`Review Request — ${item.student_name}`}>
+       <div style={{ marginBottom: 18 }}>
+         <Row label="Equipment" value={item.equipment_type_name} />
+         <Row label="Window" value={`${new Date(item.requested_start_at).toLocaleString()} → ${new Date(item.requested_return_at).toLocaleTimeString()}`} />
+         <Row label="Student email" value={item.student_email} />
++        <Row label="Available now" value={String(item.available_units)} />
+       </div>
+ 
++      {item.is_bad_sport && (
++        <div style={badSportBanner}>⚠ This student has 3 or more late returns and is flagged as a Bad Sport.</div>
++      )}
++
++      {stage === 'decide' && noStock && !rejecting && (
++        <div style={noStockBanner}>
++          No units of this equipment are currently available. Reject the request (the student will be notified and can request again when stock returns) or leave it pending.
++        </div>
++      )}
++
+       {stage === 'decide' && !rejecting && (
+         <div style={actionRow}>
+-          <button style={acceptBtn} disabled={busy} onClick={accept}>Approve &amp; Lend</button>
++          <button style={acceptBtn} disabled={busy || noStock}
++            title={noStock ? 'Cannot approve — no available stock' : undefined}
++            onClick={accept}>Approve &amp; Lend</button>
+           <button style={rejectBtn} onClick={() => setRejecting(true)}>Reject…</button>
+           <button style={ghostBtn} onClick={onBack}>Back to queue</button>
+         </div>
+@@ -266,6 +286,11 @@ const actionRow: React.CSSProperties = { display: 'flex', gap: 10, marginTop: 14
+ const detailRow: React.CSSProperties = { display: 'grid', gridTemplateColumns: '140px 1fr', padding: '8px 0', borderBottom: '1px solid #f0f0f0', fontSize: 14.5 };
+ const detailLabel: React.CSSProperties = { font: '600 13px var(--font-body)', color: '#555' };
+ const checkRow: React.CSSProperties = { display: 'flex', alignItems: 'center', gap: 8, fontSize: 14 };
++const badSportPill: React.CSSProperties = { font: '700 9.5px var(--font-mono)', padding: '2px 7px', borderRadius: 4, background: '#fbe9e7', color: '#b3352b', marginLeft: 8, verticalAlign: 'middle', letterSpacing: '0.03em' };
++const stockOk: React.CSSProperties = { font: '600 14px var(--font-mono)', color: '#1f7a45' };
++const stockZero: React.CSSProperties = { font: '600 14px var(--font-mono)', color: '#b3352b' };
++const badSportBanner: React.CSSProperties = { background: '#fef0ee', color: '#8f2323', border: '1px solid #f3caca', borderRadius: 4, padding: '8px 12px', marginBottom: 14, fontSize: 13.5 };
++const noStockBanner: React.CSSProperties = { background: '#fdf1e3', color: '#8a4413', border: '1px solid #f3d3ba', borderRadius: 4, padding: '8px 12px', marginBottom: 14, fontSize: 13.5 };
+ const box = {
+   err: { background: '#fdecec', color: '#8f2323', border: '1px solid #f3caca', borderRadius: 4, padding: '10px 14px', marginBottom: 16, fontSize: 14 } as React.CSSProperties,
+   ok: { background: '#eaf6ee', color: '#1e6b3a', border: '1px solid #c2e6cd', borderRadius: 4, padding: '10px 14px', marginBottom: 16, fontSize: 14 } as React.CSSProperties,
+diff --git a/client/src/features/borrow/MyBorrowsScreen.tsx b/client/src/features/borrow/MyBorrowsScreen.tsx
+index 417406b..b47da2f 100644
+--- a/client/src/features/borrow/MyBorrowsScreen.tsx
++++ b/client/src/features/borrow/MyBorrowsScreen.tsx
+@@ -1,73 +1,176 @@
+ /**
+- * Student — Borrow Equipment (BORROW-01..14). Submit a same-day request and
+- * track its status. No borrow action is initiated from the availability
+- * checker (EQUIP-AVAIL-09) — this is the dedicated request screen.
++ * Student — Borrow Equipment (BORROW-01..14). When arriving via the
++ * Availability screen's "Request to Borrow" link (?type=<id>), shows a
++ * product-page-style detail view for the specific equipment type. When
++ * accessed directly (/my-borrows), shows a compact picker. Start time
++ * defaults to the current time (rounded to nearest 5 min), return time
++ * to start + 1 hour. Max borrow duration is enforced client-side for
++ * immediate feedback (server enforces it too — defense in depth).
+  */
+-import { useEffect, useState, useCallback } from 'react';
++import { useEffect, useState, useCallback, useMemo } from 'react';
+ import { Navigate, useSearchParams } from 'react-router-dom';
+ import { useAuth } from '../../lib/auth.js';
+ import { PortalShell, PrimaryButton } from '../auth/PortalShell.js';
+ import { listTypes, type EquipmentType } from '../inventory/api.js';
++import { listAvailability, type AvailabilityRow } from '../availability/api.js';
+ import { submitRequest } from './api.js';
+ import { ApiRequestError } from '../../lib/api.js';
+ 
+ function errMsg(e: unknown) { return e instanceof ApiRequestError ? e.body.error : 'Something went wrong.'; }
+ 
+-// Request history moved to the Profile screen (single source of truth for a
+-// student's own borrow history) — this screen stays focused on submitting
+-// a new request.
++/** Round a Date up to the next 5-minute mark. */
++function roundTo5(d: Date): Date {
++  const ms = 5 * 60_000;
++  return new Date(Math.ceil(d.getTime() / ms) * ms);
++}
++function toTimeStr(d: Date) { return d.toTimeString().slice(0, 5); }
++function toDateStr(d: Date) { return d.toISOString().slice(0, 10); }
++
+ export default function MyBorrowsScreen() {
+   const { user, loading } = useAuth();
+   const [searchParams] = useSearchParams();
+   const preselectedType = Number(searchParams.get('type')) || 0;
+   const [types, setTypes] = useState<EquipmentType[]>([]);
++  const [availability, setAvailability] = useState<AvailabilityRow[]>([]);
+   const [error, setError] = useState<string | null>(null);
+   const [notice, setNotice] = useState<string | null>(null);
+ 
+   const load = useCallback(async () => {
+     try {
+-      const t = await listTypes();
++      const [t, a] = await Promise.all([listTypes(), listAvailability()]);
+       setTypes(t.types);
++      setAvailability(a.status);
+     } catch (e) { setError(errMsg(e)); }
+   }, []);
+   useEffect(() => { void load(); }, [load]);
+ 
+-  if (loading) return <PortalShell title="My Borrows"><p /></PortalShell>;
++  if (loading) return <PortalShell title="Request Equipment"><p /></PortalShell>;
+   if (!user) return <Navigate to="/" replace />;
+   if (user.role !== 'STUDENT') return <Navigate to="/home" replace />;
+ 
+   return (
+-    <PortalShell title="My Borrows" tint="sage">
++    <PortalShell title="Request Equipment" tint="sage">
+       <div style={wrap}>
+         {error && <div style={box.err}>{error}</div>}
+         {notice && <div style={box.ok}>{notice}</div>}
+ 
+-        <Panel title="Request Equipment">
+-          <RequestForm types={types} preselectedType={preselectedType}
+-            onDone={(m) => { setNotice(m); setError(null); void load(); }} onError={(m) => { setError(m); setNotice(null); }} />
+-        </Panel>
+-
+-        <p style={{ ...muted, textAlign: 'center' }}>
+-          Your request history is now on your <a href="/profile" style={{ color: '#0a6ebd' }}>Profile</a> page.
+-        </p>
++        {preselectedType ? (
++          <ProductDetailRequest
++            typeId={preselectedType}
++            types={types}
++            availability={availability}
++            onDone={(m) => { setNotice(m); setError(null); void load(); }}
++            onError={(m) => { setError(m); setNotice(null); }}
++          />
++        ) : (
++          <Panel title="Request Equipment">
++            <RequestForm
++              types={types}
++              availability={availability}
++              onDone={(m) => { setNotice(m); setError(null); void load(); }}
++              onError={(m) => { setError(m); setNotice(null); }}
++            />
++          </Panel>
++        )}
+       </div>
+     </PortalShell>
+   );
+ }
+ 
+-function RequestForm({ types, preselectedType, onDone, onError }: {
+-  types: EquipmentType[]; preselectedType?: number;
++/** Product-page style view when a specific equipment type is pre-selected. */
++function ProductDetailRequest({ typeId, types, availability, onDone, onError }: {
++  typeId: number; types: EquipmentType[]; availability: AvailabilityRow[];
+   onDone: (m: string) => void; onError: (m: string) => void;
+ }) {
+-  const [equipmentTypeId, setType] = useState(preselectedType ?? 0);
+-  const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
+-  const [startTime, setStartTime] = useState('10:00');
+-  const [endTime, setEndTime] = useState('13:00');
++  const eqType = types.find((t) => t.equipment_type_id === typeId);
++  const avail = availability.find((a) => a.equipmentTypeId === typeId);
++
++  if (types.length > 0 && !eqType) {
++    return <Panel title="Equipment Not Found"><p style={muted}>This equipment type does not exist or is no longer available.</p></Panel>;
++  }
++  if (!eqType) return <Panel title="Loading…"><p style={muted}>Loading equipment details…</p></Panel>;
++
++  const availableUnits = avail?.availableUnits ?? 0;
++  const maxMinutes = eqType.max_borrow_duration_minutes;
++
++  return (
++    <div style={productLayout}>
++      {/* Image / placeholder */}
++      <div style={productImageWrap}>
++        {eqType.image_url ? (
++          <img src={eqType.image_url} alt={eqType.name} style={productImage} onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }} />
++        ) : (
++          <div style={productImagePlaceholder}>{eqType.name.charAt(0)}</div>
++        )}
++      </div>
++
++      {/* Details + form */}
++      <div style={productDetails}>
++        <div style={productMeta}>{eqType.sport_category_name}</div>
++        <h2 style={productTitle}>{eqType.name}</h2>
++        <div style={productTags}>
++          <span style={tag}>{eqType.is_indoor ? 'Indoor' : 'Outdoor'}</span>
++          <span style={tag}>{eqType.lending_unit === 'PAIR' ? 'Lent as pair' : 'Single unit'}</span>
++        </div>
++
++        <div style={stockRow}>
++          <span style={{ ...stockNumber, color: availableUnits > 0 ? '#1f7a45' : '#b3352b' }}>{availableUnits}</span>
++          <span style={stockLabel}>unit{availableUnits !== 1 ? 's' : ''} available</span>
++        </div>
++
++        <div style={divider} />
++
++        <RequestForm
++          types={types}
++          availability={availability}
++          fixedTypeId={typeId}
++          maxMinutesProp={maxMinutes}
++          onDone={onDone}
++          onError={onError}
++        />
++      </div>
++    </div>
++  );
++}
++
++function RequestForm({ types, availability, fixedTypeId, maxMinutesProp, onDone, onError }: {
++  types: EquipmentType[]; availability: AvailabilityRow[];
++  fixedTypeId?: number; maxMinutesProp?: number;
++  onDone: (m: string) => void; onError: (m: string) => void;
++}) {
++  const now = useMemo(() => roundTo5(new Date()), []);
++  const oneHourLater = useMemo(() => new Date(now.getTime() + 60 * 60_000), [now]);
++
++  const [equipmentTypeId, setType] = useState(fixedTypeId ?? 0);
++  const [date, setDate] = useState(() => toDateStr(now));
++  const [startTime, setStartTime] = useState(() => toTimeStr(now));
++  const [endTime, setEndTime] = useState(() => toTimeStr(oneHourLater));
+   const [busy, setBusy] = useState(false);
+ 
++  const selectedType = types.find((t) => t.equipment_type_id === equipmentTypeId);
++  const maxMinutes = selectedType?.max_borrow_duration_minutes ?? maxMinutesProp ?? 0;
++
++  // Client-side max-duration validation
++  const durationError = useMemo(() => {
++    if (!startTime || !endTime || !maxMinutes) return null;
++    const start = new Date(`${date}T${startTime}:00`);
++    const end = new Date(`${date}T${endTime}:00`);
++    if (isNaN(start.getTime()) || isNaN(end.getTime())) return null;
++    const mins = (end.getTime() - start.getTime()) / 60_000;
++    if (mins <= 0) return 'Return time must be after start time.';
++    if (mins > maxMinutes) {
++      const h = Math.floor(maxMinutes / 60);
++      const m = maxMinutes % 60;
++      const dur = h > 0 && m > 0 ? `${h}h ${m}m` : h > 0 ? `${h}h` : `${m}m`;
++      return `Maximum borrow duration is ${dur}.`;
++    }
++    return null;
++  }, [startTime, endTime, date, maxMinutes]);
++
+   async function submit(e: React.FormEvent) {
+     e.preventDefault();
+     if (!equipmentTypeId) { onError('Choose an equipment type.'); return; }
++    if (durationError) { onError(durationError); return; }
+     setBusy(true);
+     try {
+       const requestedStartAt = new Date(`${date}T${startTime}:00`).toISOString();
+@@ -79,14 +182,28 @@ function RequestForm({ types, preselectedType, onDone, onError }: {
+ 
+   return (
+     <form onSubmit={submit} style={formGrid}>
+-      <L label="Equipment"><select style={inp} value={equipmentTypeId} onChange={(e) => setType(Number(e.target.value))} required>
+-        <option value={0}>Select</option>
+-        {types.map((t) => <option key={t.equipment_type_id} value={t.equipment_type_id}>{t.name}</option>)}
+-      </select></L>
++      {!fixedTypeId && (
++        <L label="Equipment">
++          <select style={inp} value={equipmentTypeId} onChange={(e) => setType(Number(e.target.value))} required>
++            <option value={0}>Select</option>
++            {types.filter((t) => t.equipment_type_id).map((t) => {
++              const av = availability.find((a) => a.equipmentTypeId === t.equipment_type_id);
++              const units = av?.availableUnits ?? 0;
++              return <option key={t.equipment_type_id} value={t.equipment_type_id}>{t.name} ({units} available)</option>;
++            })}
++          </select>
++        </L>
++      )}
+       <L label="Date"><input type="date" style={inp} value={date} onChange={(e) => setDate(e.target.value)} required /></L>
+       <L label="Start time"><input type="time" style={inp} value={startTime} onChange={(e) => setStartTime(e.target.value)} required /></L>
+       <L label="Return time"><input type="time" style={inp} value={endTime} onChange={(e) => setEndTime(e.target.value)} required /></L>
+-      <div style={{ gridColumn: '1 / -1' }}><PrimaryButton disabled={busy}>{busy ? 'Submitting…' : 'Submit Request'}</PrimaryButton></div>
++      {durationError && <div style={{ ...durationWarn, gridColumn: '1 / -1' }}>{durationError}</div>}
++      {maxMinutes > 0 && !durationError && (
++        <div style={{ ...durationHint, gridColumn: '1 / -1' }}>
++          Max borrow duration: {Math.floor(maxMinutes / 60) > 0 ? `${Math.floor(maxMinutes / 60)}h` : ''}{maxMinutes % 60 > 0 ? ` ${maxMinutes % 60}m` : ''}
++        </div>
++      )}
++      <div style={{ gridColumn: '1 / -1' }}><PrimaryButton disabled={busy || !!durationError}>{busy ? 'Submitting…' : 'Submit Request'}</PrimaryButton></div>
+     </form>
+   );
+ }
+@@ -98,6 +215,7 @@ function L({ label, children }: { label: string; children: React.ReactNode }) {
+   return <label style={{ display: 'block' }}><span style={lbl}>{label}</span>{children}</label>;
+ }
+ 
++// ── Styles ──
+ const wrap: React.CSSProperties = { maxWidth: 820, margin: '0 auto' };
+ const panel: React.CSSProperties = { background: '#fff', border: '1px solid #ddd', borderRadius: 4, marginBottom: 18, boxShadow: '0 1px 2px rgba(0,0,0,0.05)' };
+ const panelHead: React.CSSProperties = { padding: '12px 18px', borderBottom: '1px solid #e5e5e5', font: '600 15px var(--font-body)', color: '#333', background: 'linear-gradient(#fff,#f7f7f7)' };
+@@ -110,3 +228,20 @@ const box = {
+   err: { background: '#fdecec', color: '#8f2323', border: '1px solid #f3caca', borderRadius: 4, padding: '10px 14px', marginBottom: 16, fontSize: 14 } as React.CSSProperties,
+   ok: { background: '#eaf6ee', color: '#1e6b3a', border: '1px solid #c2e6cd', borderRadius: 4, padding: '10px 14px', marginBottom: 16, fontSize: 14 } as React.CSSProperties,
+ };
++const durationWarn: React.CSSProperties = { color: '#b3352b', fontSize: 13, background: '#fef0ee', border: '1px solid #f3caca', borderRadius: 4, padding: '6px 10px' };
++const durationHint: React.CSSProperties = { color: '#8a949f', fontSize: 12.5 };
++
++// Product-page layout
++const productLayout: React.CSSProperties = { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 0, background: '#fff', border: '1px solid #ddd', borderRadius: 4, overflow: 'hidden', boxShadow: '0 1px 2px rgba(0,0,0,0.05)', marginBottom: 18 };
++const productImageWrap: React.CSSProperties = { background: '#eef1f4', display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: 320 };
++const productImage: React.CSSProperties = { width: '100%', height: '100%', objectFit: 'cover', display: 'block' };
++const productImagePlaceholder: React.CSSProperties = { font: '600 72px var(--font-display)', color: '#b8c2cc' };
++const productDetails: React.CSSProperties = { padding: '28px 28px 24px' };
++const productMeta: React.CSSProperties = { font: '600 11px var(--font-mono)', color: '#0a6ebd', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 4 };
++const productTitle: React.CSSProperties = { font: '700 24px var(--font-display)', color: '#1a1d21', margin: '0 0 10px' };
++const productTags: React.CSSProperties = { display: 'flex', gap: 8, marginBottom: 14 };
++const tag: React.CSSProperties = { font: '500 11.5px var(--font-body)', padding: '3px 10px', borderRadius: 12, background: '#eef2f6', color: '#5c6773' };
++const stockRow: React.CSSProperties = { display: 'flex', alignItems: 'baseline', gap: 6, marginBottom: 6 };
++const stockNumber: React.CSSProperties = { font: '700 28px var(--font-display)' };
++const stockLabel: React.CSSProperties = { fontSize: 13, color: '#5c6773' };
++const divider: React.CSSProperties = { borderTop: '1px solid #e5e5e5', margin: '16px 0' };
+diff --git a/client/src/features/borrow/api.ts b/client/src/features/borrow/api.ts
+index 711013e..a4b9ce1 100644
+--- a/client/src/features/borrow/api.ts
++++ b/client/src/features/borrow/api.ts
+@@ -9,6 +9,7 @@ export interface QueueItem {
+   borrow_request_id: string; requested_start_at: string; requested_return_at: string; submitted_at: string;
+   equipment_type_id: number; equipment_type_name: string;
+   student_id: string; student_name: string; student_email: string;
++  available_units: number; is_bad_sport: boolean;
+ }
+ export interface ActiveBorrow {
+   borrow_txn_id: string; status: string; agreed_return_at: string; actual_start_at: string;
+diff --git a/server/src/features/borrow/service.ts b/server/src/features/borrow/service.ts
+index b7a6f56..a8a9239 100644
+--- a/server/src/features/borrow/service.ts
++++ b/server/src/features/borrow/service.ts
+@@ -15,7 +15,12 @@ import { sendEmail } from '../../lib/email.js';
+ function mapDbError(e: unknown): AppError {
+   if (isPgError(e)) {
+     if (e.code === 'P0001') return new AppError(422, e.message.replace(/^ERROR:\s*/i, ''), 'RULE');
+-    if (e.code === '23505') return conflict('That conflicts with an existing record.', 'DUPLICATE');
++    if (e.code === '23505') {
++      if (e.constraint === 'uq_one_open_borrow_request') {
++        return conflict('You already have a pending request. Wait for it to be reviewed before submitting another.', 'DUPLICATE');
++      }
++      return conflict('That conflicts with an existing record.', 'DUPLICATE');
++    }
+     if (e.code === '23503') return badRequest('Referenced item does not exist.', 'FK');
+   }
+   if (e instanceof AppError) return e;
+@@ -91,11 +96,21 @@ export async function submitRequest(studentId: string, input: {
+   // BORROW-14: cannot request equipment with zero available units.
+   // Archived types are excluded from the availability checker, but guard here
+   // too in case of a direct API call with a stale/known type id.
+-  const type = await db.selectFrom('equipment_type').select('is_active')
++  const type = await db.selectFrom('equipment_type').select(['is_active', 'name', 'max_borrow_duration_minutes'])
+     .where('equipment_type_id', '=', input.equipmentTypeId).executeTakeFirst();
+   if (!type) throw notFound('Equipment type not found.');
+   if (!type.is_active) throw conflict('This equipment type is no longer offered for borrowing.', 'ARCHIVED');
+ 
++  // Enforce max borrow duration.
++  const maxMinutes = type.max_borrow_duration_minutes;
++  const requestedMinutes = (new Date(input.requestedReturnAt).getTime() - new Date(input.requestedStartAt).getTime()) / 60_000;
++  if (requestedMinutes > maxMinutes) {
++    const h = Math.floor(maxMinutes / 60);
++    const m = maxMinutes % 60;
++    const dur = h > 0 && m > 0 ? `${h}h ${m}m` : h > 0 ? `${h}h` : `${m}m`;
++    throw badRequest(`${type.name} can be borrowed for at most ${dur}. Shorten your requested window.`, 'MAX_DURATION');
++  }
++
+   const avail = await db.selectFrom('v_article_availability').select('available_units')
+     .where('equipment_type_id', '=', input.equipmentTypeId).executeTakeFirst();
+   if (!avail || Number(avail.available_units) <= 0) {
+@@ -128,14 +143,27 @@ export async function listMyRequests(studentId: string) {
+ }
+ 
+ export async function listQueue() {
+-  return db.selectFrom('borrow_request as br')
++  const rows = await db.selectFrom('borrow_request as br')
+     .innerJoin('equipment_type as et', 'et.equipment_type_id', 'br.equipment_type_id')
+     .innerJoin('app_user as u', 'u.user_id', 'br.requested_by')
+-    .select(['br.borrow_request_id', 'br.requested_start_at', 'br.requested_return_at', 'br.submitted_at',
++    .leftJoin('v_article_availability as va', 'va.equipment_type_id', 'br.equipment_type_id')
++    .leftJoin('v_client_reputation as cr', 'cr.user_id', 'br.requested_by')
++    .select([
++      'br.borrow_request_id', 'br.requested_start_at', 'br.requested_return_at', 'br.submitted_at',
+       'br.equipment_type_id', 'et.name as equipment_type_name',
+-      'u.user_id as student_id', 'u.full_name as student_name', 'u.email as student_email'])
++      'u.user_id as student_id', 'u.full_name as student_name', 'u.email as student_email',
++      sql<number>`coalesce(va.available_units, 0)`.as('available_units'),
++      sql<number>`coalesce(cr.late_returns, 0)`.as('late_returns'),
++    ])
+     .where('br.status', '=', 'PENDING')
+     .orderBy('br.submitted_at', 'asc').execute();
++
++  return rows.map((r) => ({
++    ...r,
++    available_units: Number(r.available_units),
++    is_bad_sport: Number(r.late_returns) >= BAD_SPORT_THRESHOLD,
++    late_returns: undefined, // don't leak raw count to client
++  }));
+ }
+ 
+ export async function approveRequest(requestId: string, coordinatorId: string) {
+@@ -145,6 +173,18 @@ export async function approveRequest(requestId: string, coordinatorId: string) {
+     if (!req) throw notFound('Request not found.');
+     if (req.status !== 'PENDING') throw conflict(`Request is already ${req.status}.`);
+ 
++    // Check live stock BEFORE approving — don't let a coordinator approve a
++    // request only to discover at hand-out time that nothing is available.
++    const avail = await db.selectFrom('v_article_availability').select('available_units')
++      .where('equipment_type_id', '=', req.equipment_type_id).executeTakeFirst();
++    if (!avail || Number(avail.available_units) <= 0) {
++      throw conflict(
++        'No units of this equipment are currently available to lend. ' +
++        'Reject the request (the student will be notified) or leave it pending until stock frees up.',
++        'NO_STOCK',
++      );
++    }
++
+     await db.updateTable('borrow_request')
+       .set({ status: 'APPROVED', decided_by: coordinatorId, decided_at: sql`now()` })
+       .where('borrow_request_id', '=', requestId).execute();
+diff --git a/server/tests/borrow.test.ts b/server/tests/borrow.test.ts
+index 48d71c5..aa4c58f 100644
+--- a/server/tests/borrow.test.ts
++++ b/server/tests/borrow.test.ts
+@@ -337,3 +337,87 @@ describe('Overdue detection (BORROW-18)', () => {
+     expect(row.status).toBe('OVERDUE');
+   });
+ });
++
++// ═══════════════════════════ BORROW POLISH (max-duration, approve-stock, duplicate msg, queue fields) ═══════════════════════════
++describe('Borrow polish fixes', () => {
++  it('T-616: submitRequest rejects when requested window exceeds max_borrow_duration_minutes', async () => {
++    const stu = await studentAgent(staff);
++    const typeId = await makeSingleType(staff, 'Short Loan Racket'); // maxBorrowDurationMinutes = 120 (2h)
++    await addArticle(staff, typeId, bc(220));
++    // Request a 3-hour window — exceeds the 2h max.
++    const start = new Date(); start.setHours(10, 0, 0, 0);
++    const end = new Date(); end.setHours(13, 0, 0, 0);
++    const res = await stu.post('/api/borrow/requests').send({
++      equipmentTypeId: typeId, requestedStartAt: iso(start), requestedReturnAt: iso(end),
++    });
++    expect(res.status).toBe(400);
++    expect(res.body.error).toMatch(/at most 2h/i);
++  });
++
++  it('T-617: submitRequest succeeds when requested window equals max_borrow_duration_minutes', async () => {
++    const stu = await studentAgent(staff);
++    const typeId = await makeSingleType(staff, 'Exact Fit Racket'); // 120 min
++    await addArticle(staff, typeId, bc(221));
++    // Request exactly 2 hours — should succeed.
++    const start = new Date(); start.setHours(10, 0, 0, 0);
++    const end = new Date(); end.setHours(12, 0, 0, 0);
++    const res = await stu.post('/api/borrow/requests').send({
++      equipmentTypeId: typeId, requestedStartAt: iso(start), requestedReturnAt: iso(end),
++    });
++    expect(res.status).toBe(201);
++  });
++
++  it('T-618: approveRequest blocks approval when zero stock is available', async () => {
++    const stu1 = await studentAgent(staff);
++    const stu2 = await studentAgent(staff);
++    const typeId = await makeSingleType(staff, 'One-Only Ball');
++    const articleId = await addArticle(staff, typeId, bc(222));
++    const { start, end } = todayWindow();
++    // stu1 requests and gets lent the only article
++    const r1 = await stu1.post('/api/borrow/requests').send({
++      equipmentTypeId: typeId,
++      requestedStartAt: iso(new Date(new Date(start).getTime() - 3600_000)),
++      requestedReturnAt: iso(new Date(new Date(end).getTime() + 3600_000)),
++    });
++    await coord.post(`/api/borrow/requests/${r1.body.request.borrowRequestId}/approve`).send({});
++    await coord.post('/api/borrow/lend/platform').send({
++      borrowRequestId: r1.body.request.borrowRequestId, articleIds: [articleId],
++      agreedStartAt: iso(new Date(new Date(start).getTime() - 3600_000)),
++      agreedReturnAt: iso(new Date(new Date(end).getTime() + 3600_000)),
++    });
++    // stu2 requests the same type — stock is now 0
++    const r2 = await stu2.post('/api/borrow/requests').send({ equipmentTypeId: typeId, requestedStartAt: start, requestedReturnAt: end });
++    // Request submission should fail because stock is 0
++    expect(r2.status).toBe(409);
++  });
++
++  it('T-619: duplicate pending request returns an accurate "already have a pending request" message', async () => {
++    const stu = await studentAgent(staff);
++    const typeId1 = await makeSingleType(staff, 'Tennis Ball');
++    const typeId2 = await makeSingleType(staff, 'Tennis Racket');
++    await addArticle(staff, typeId1, bc(223));
++    await addArticle(staff, typeId2, bc(224));
++    const { start, end } = todayWindow();
++    const r1 = await stu.post('/api/borrow/requests').send({ equipmentTypeId: typeId1, requestedStartAt: start, requestedReturnAt: end });
++    expect(r1.status).toBe(201);
++    // Second request (different equipment) should hit the uq_one_open_borrow_request constraint
++    const r2 = await stu.post('/api/borrow/requests').send({ equipmentTypeId: typeId2, requestedStartAt: start, requestedReturnAt: end });
++    expect(r2.status).toBe(409);
++    expect(r2.body.error).toMatch(/already have a pending request/i);
++  });
++
++  it('T-620: listQueue returns available_units and is_bad_sport per row', async () => {
++    const stu = await studentAgent(staff);
++    const typeId = await makeSingleType(staff, 'Queue Field Ball');
++    await addArticle(staff, typeId, bc(225));
++    const { start, end } = todayWindow();
++    await stu.post('/api/borrow/requests').send({ equipmentTypeId: typeId, requestedStartAt: start, requestedReturnAt: end });
++    const queue = await staff.get('/api/borrow/queue');
++    const row = queue.body.queue.find((q: { equipment_type_name: string }) => q.equipment_type_name === 'Queue Field Ball');
++    expect(row).toBeDefined();
++    expect(typeof row.available_units).toBe('number');
++    expect(row.available_units).toBeGreaterThanOrEqual(1);
++    expect(typeof row.is_bad_sport).toBe('boolean');
++    expect(row.is_bad_sport).toBe(false);
++  });
++});
+-- 
+2.43.0
+

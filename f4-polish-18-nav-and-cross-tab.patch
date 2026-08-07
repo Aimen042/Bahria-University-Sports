@@ -1,0 +1,297 @@
+From 094d5e6920a08deda4eb79519e70ed4b970abf92 Mon Sep 17 00:00:00 2001
+From: Raza <raza@bukc.edu.pk>
+Date: Thu, 30 Jul 2026 09:06:20 +0000
+Subject: [PATCH] fix(nav+auth): remove standalone My Borrows access; detect
+ cross-tab session replacement
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Two fixes.
+
+1. MY BORROWS NO LONGER A STANDALONE UI DESTINATION. Now that every
+   equipment card on Availability links to its own product-page-style
+   request screen (?type=<id>), the generic My Borrows nav button (Student
+   dashboard) and the Profile 'Request Equipment ->' link (which pointed at
+   the bare /my-borrows) were redundant with — and a visibly worse version
+   of — the same underlying screen. Removed both nav references. The route,
+   the screen itself, and its compact-picker fallback all stay fully
+   functional and untouched — the per-equipment flow depends on this exact
+   mechanism (?type= lands on the same MyBorrowsScreen). Profile's 'Request
+   Equipment ->' now points at /availability instead.
+
+2. CROSS-TAB SESSION REPLACEMENT (the 'I see the other tab's dashboard'
+   bug). Root cause: the refresh token lives in one HTTP-only cookie
+   scoped to the browser origin, not per-tab — this is fundamental to how
+   cookies work, not an application bug. If a Super Admin is signed in on
+   one tab and a Coordinator signs in on another tab of the SAME browser,
+   the second login overwrites the one shared cookie. The first tab
+   doesn't notice right away (its access token is still valid in memory),
+   but the next time that token expires and api.ts transparently refreshes
+   on its behalf, the cookie now belongs to the OTHER account — so the
+   silent refresh would previously come back as the wrong identity with
+   zero signal to the user, who'd just start seeing someone else's
+   dashboard mid-session.
+
+   This can't be 'fixed' into two simultaneous different logins coexisting
+   in one browser's tabs (that needs separate cookie jars — separate
+   browser profiles, an Incognito window, or a different browser) — but
+   the SILENT, UNSIGNALED part is exactly what's fixable and dangerous.
+   api.ts now tracks which identity each tab itself believes it's
+   authenticated as; the transparent-refresh path compares the server's
+   response against that before accepting it, and on a mismatch clears the
+   token, fires a 'session replaced' event, and refuses to adopt the new
+   identity. auth.tsx listens for that event, clears local user state, and
+   shows a persistent, clearly-worded banner explaining what happened and
+   that the person needs to sign in again — rather than silently swapping
+   the rendered dashboard underneath them. A fresh page load in a tab that
+   never had an established identity is unaffected (nothing to compare
+   against yet, same as opening a brand new tab) — only an
+   already-active session's silent background refresh is guarded.
+
+Verified: tsc --noEmit clean, full production build clean. No server
+changes in this patch (both fixes are client-only).
+---
+ client/.gitignore                             |  1 +
+ client/src/features/auth/HomeScreen.tsx       |  3 --
+ client/src/features/auth/ProfileScreen.tsx    |  2 +-
+ .../src/features/borrow/MyBorrowsScreen.tsx   | 12 +++--
+ client/src/lib/api.ts                         | 44 ++++++++++++++-
+ client/src/lib/auth.tsx                       | 53 +++++++++++++++++--
+ 6 files changed, 103 insertions(+), 12 deletions(-)
+ create mode 100644 client/.gitignore
+
+diff --git a/client/.gitignore b/client/.gitignore
+new file mode 100644
+index 0000000..91e3d75
+--- /dev/null
++++ b/client/.gitignore
+@@ -0,0 +1 @@
++client/tsconfig.tsbuildinfo
+diff --git a/client/src/features/auth/HomeScreen.tsx b/client/src/features/auth/HomeScreen.tsx
+index 1e9dd9d..201bdc1 100644
+--- a/client/src/features/auth/HomeScreen.tsx
++++ b/client/src/features/auth/HomeScreen.tsx
+@@ -52,9 +52,6 @@ export default function HomeScreen() {
+               <PrimaryButton onClick={() => navigate('/inventory')}>Inventory</PrimaryButton>
+             )}
+             <PrimaryButton onClick={() => navigate('/availability')}>Equipment Availability</PrimaryButton>
+-            {user.role === 'STUDENT' && (
+-              <PrimaryButton onClick={() => navigate('/my-borrows')}>My Borrows</PrimaryButton>
+-            )}
+             {user.role === 'COORDINATOR' && (
+               <PrimaryButton onClick={() => navigate('/borrow-queue')}>Borrow Queue</PrimaryButton>
+             )}
+diff --git a/client/src/features/auth/ProfileScreen.tsx b/client/src/features/auth/ProfileScreen.tsx
+index f5249d5..b688fbd 100644
+--- a/client/src/features/auth/ProfileScreen.tsx
++++ b/client/src/features/auth/ProfileScreen.tsx
+@@ -236,7 +236,7 @@ function StudentActivity({ userId, onError }: { userId: string; onError: (m: str
+   }, [userId, onError]);
+ 
+   return (
+-    <Panel title="Borrowing Activity" action={<button style={linkBtn} onClick={() => navigate('/my-borrows')}>Request Equipment →</button>}>
++    <Panel title="Borrowing Activity" action={<button style={linkBtn} onClick={() => navigate('/availability')}>Request Equipment →</button>}>
+       {rep && (
+         <>
+           {rep.isBadSport && (
+diff --git a/client/src/features/borrow/MyBorrowsScreen.tsx b/client/src/features/borrow/MyBorrowsScreen.tsx
+index b47da2f..4e9d214 100644
+--- a/client/src/features/borrow/MyBorrowsScreen.tsx
++++ b/client/src/features/borrow/MyBorrowsScreen.tsx
+@@ -1,8 +1,12 @@
+ /**
+- * Student — Borrow Equipment (BORROW-01..14). When arriving via the
+- * Availability screen's "Request to Borrow" link (?type=<id>), shows a
+- * product-page-style detail view for the specific equipment type. When
+- * accessed directly (/my-borrows), shows a compact picker. Start time
++ * Student — Borrow Equipment (BORROW-01..14). Not linked from anywhere in
++ * the UI as a standalone destination anymore — every equipment card on
++ * Availability has its own "Request to Borrow" link that lands here with
++ * ?type=<id>, showing a product-page-style detail view for that specific
++ * type. This screen and its route stay fully functional (the per-equipment
++ * flow depends on it), the compact-picker fallback below still exists for
++ * a bare /my-borrows visit, it's just intentionally not surfaced via any
++ * nav button or link — Availability is the one entry point now. Start time
+  * defaults to the current time (rounded to nearest 5 min), return time
+  * to start + 1 hour. Max borrow duration is enforced client-side for
+  * immediate feedback (server enforces it too — defense in depth).
+diff --git a/client/src/lib/api.ts b/client/src/lib/api.ts
+index 2c0c13e..5ca2cfd 100644
+--- a/client/src/lib/api.ts
++++ b/client/src/lib/api.ts
+@@ -5,10 +5,26 @@
+  *  - on a 401, transparently try /api/auth/refresh once, then retry the request
+  *
+  * Feature routers add typed wrappers over `api()`; this is the transport.
++ *
++ * Cross-tab caveat (by design of HTTP cookies, not fixable in app code): the
++ * refresh cookie lives at the browser/origin level, not per-tab. If a Super
++ * Admin is signed in on one tab and a Coordinator signs in on another tab of
++ * the SAME browser, that second login overwrites the ONE shared cookie. The
++ * first tab doesn't notice immediately (its access token is still valid in
++ * memory), but the next time its access token expires and this module
++ * silently refreshes on its behalf, the cookie now belongs to the OTHER
++ * account — so the refresh would otherwise come back as the wrong identity
++ * with no signal to the user. We can't make two simultaneous different
++ * logins coexist in tabs of one browser (that would need separate cookie
++ * jars — separate browser profiles / an Incognito window / a different
++ * browser altogether), but we CAN detect the mismatch and force a clean,
++ * explicit sign-out instead of silently swapping the dashboard underneath
++ * the user. See SESSION_REPLACED_EVENT below.
+  */
+ const API_BASE = import.meta.env.VITE_API_BASE ?? '';
+ 
+ let accessToken: string | null = null;
++let currentUserId: string | null = null;
+ 
+ export function setAccessToken(token: string | null): void {
+   accessToken = token;
+@@ -17,6 +33,13 @@ export function getAccessToken(): string | null {
+   return accessToken;
+ }
+ 
++/** Record which identity THIS tab believes it's authenticated as. */
++export function setCurrentUserId(userId: string | null): void {
++  currentUserId = userId;
++}
++
++export const SESSION_REPLACED_EVENT = 'bukc:session-replaced';
++
+ export interface ApiError {
+   error: string;
+   code?: string;
+@@ -62,6 +85,25 @@ export function refreshSession(): Promise<RefreshResult | null> {
+   return inFlightRefresh;
+ }
+ 
++/**
++ * Same as refreshSession(), but for an ALREADY-established tab (i.e. this
++ * tab previously knew who it was) — the transparent 401-retry path uses
++ * this, not the raw refreshSession(), specifically to catch the cross-tab
++ * cookie-overwrite case above. A mismatch means another login on another
++ * tab silently replaced this tab's session; we surface that explicitly
++ * rather than adopting the new identity.
++ */
++async function refreshAndCheckIdentity(): Promise<RefreshResult | null> {
++  const result = await refreshSession();
++  if (result && currentUserId && result.user.userId !== currentUserId) {
++    setAccessToken(null);
++    setCurrentUserId(null);
++    window.dispatchEvent(new CustomEvent(SESSION_REPLACED_EVENT));
++    return null;
++  }
++  return result;
++}
++
+ export async function api<T = unknown>(path: string, opts: RequestOptions = {}): Promise<T> {
+   const { body, _isRetry, headers, ...rest } = opts;
+ 
+@@ -78,7 +120,7 @@ export async function api<T = unknown>(path: string, opts: RequestOptions = {}):
+ 
+   // transparent refresh on expired access token
+   if (res.status === 401 && !_isRetry) {
+-    const refreshed = await refreshSession();
++    const refreshed = await refreshAndCheckIdentity();
+     if (refreshed) {
+       setAccessToken(refreshed.accessToken);
+       return api<T>(path, { ...opts, _isRetry: true });
+diff --git a/client/src/lib/auth.tsx b/client/src/lib/auth.tsx
+index e70cf20..15880b5 100644
+--- a/client/src/lib/auth.tsx
++++ b/client/src/lib/auth.tsx
+@@ -7,7 +7,7 @@
+  * is what every screen depends on.
+  */
+ import { createContext, useContext, useEffect, useState, type ReactNode } from 'react';
+-import { api, setAccessToken, refreshSession } from './api.js';
++import { api, setAccessToken, setCurrentUserId, refreshSession, SESSION_REPLACED_EVENT } from './api.js';
+ 
+ export type UserRole = 'SUPER_ADMIN' | 'COORDINATOR' | 'STUDENT' | 'EXTERNAL';
+ 
+@@ -23,13 +23,25 @@ interface AuthContextValue {
+   loading: boolean;
+   setUser: (u: CurrentUser | null) => void;
+   logout: () => Promise<void>;
++  /** Set when this tab's session was silently replaced by a different login
++   *  on another tab of the same browser (see api.ts for why this can happen
++   *  — one shared refresh cookie per browser, not per tab). Show this,
++   *  then clear it once acknowledged. */
++  sessionReplacedNotice: boolean;
++  clearSessionReplacedNotice: () => void;
+ }
+ 
+ const AuthContext = createContext<AuthContextValue | null>(null);
+ 
+ export function AuthProvider({ children }: { children: ReactNode }) {
+-  const [user, setUser] = useState<CurrentUser | null>(null);
++  const [user, setUserState] = useState<CurrentUser | null>(null);
+   const [loading, setLoading] = useState(true);
++  const [sessionReplacedNotice, setSessionReplacedNotice] = useState(false);
++
++  function setUser(u: CurrentUser | null) {
++    setCurrentUserId(u?.userId ?? null);
++    setUserState(u);
++  }
+ 
+   // On load: try to restore a session via the refresh cookie. refreshSession()
+   // is shared/deduplicated in api.ts, so this is safe even under React
+@@ -50,6 +62,19 @@ export function AuthProvider({ children }: { children: ReactNode }) {
+     };
+   }, []);
+ 
++  // A background token refresh (api.ts) detected this tab's session was
++  // silently replaced by a different login elsewhere in the same browser —
++  // clear everything and tell the person plainly, rather than letting them
++  // keep acting as if they're still the account they started as.
++  useEffect(() => {
++    function onReplaced() {
++      setUserState(null);
++      setSessionReplacedNotice(true);
++    }
++    window.addEventListener(SESSION_REPLACED_EVENT, onReplaced);
++    return () => window.removeEventListener(SESSION_REPLACED_EVENT, onReplaced);
++  }, []);
++
+   async function logout() {
+     try {
+       await api('/api/auth/logout', { method: 'POST' });
+@@ -60,12 +85,34 @@ export function AuthProvider({ children }: { children: ReactNode }) {
+   }
+ 
+   return (
+-    <AuthContext.Provider value={{ user, loading, setUser, logout }}>
++    <AuthContext.Provider value={{
++      user, loading, setUser, logout,
++      sessionReplacedNotice, clearSessionReplacedNotice: () => setSessionReplacedNotice(false),
++    }}>
++      {sessionReplacedNotice && (
++        <div style={bannerStyle}>
++          <span>
++            You were signed out — a different account signed in on another tab of this browser
++            (the login session is shared per browser, not per tab). Please sign in again.
++          </span>
++          <button onClick={() => setSessionReplacedNotice(false)} style={bannerCloseStyle} aria-label="Dismiss">×</button>
++        </div>
++      )}
+       {children}
+     </AuthContext.Provider>
+   );
+ }
+ 
++const bannerStyle: React.CSSProperties = {
++  position: 'fixed', top: 0, left: 0, right: 0, zIndex: 2000,
++  background: '#fdf1e3', color: '#8a4413', borderBottom: '1px solid #f3d3ba',
++  padding: '10px 20px', fontSize: 13.5, display: 'flex', alignItems: 'center',
++  justifyContent: 'center', gap: 16, textAlign: 'center',
++};
++const bannerCloseStyle: React.CSSProperties = {
++  background: 'none', border: 'none', fontSize: 18, lineHeight: 1, color: '#8a4413', cursor: 'pointer', padding: 0,
++};
++
+ export function useAuth(): AuthContextValue {
+   const ctx = useContext(AuthContext);
+   if (!ctx) throw new Error('useAuth must be used within AuthProvider');
+-- 
+2.43.0
+

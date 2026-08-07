@@ -1,0 +1,353 @@
+From a2e75036ccb8d74c324f1a33fa7e67f3c7e2305b Mon Sep 17 00:00:00 2001
+From: Raza <raza@bukc.edu.pk>
+Date: Thu, 30 Jul 2026 10:56:05 +0000
+Subject: [PATCH] fix(auth): lockout counter never reset after expiry, causing
+ effectively indefinite lock
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Real bug, not a stale UI message — confirmed and reproduced against a
+real database before fixing.
+
+failed_login_count was only ever reset to 0 on a SUCCESSFUL login. Once
+an account crossed the 5-failure threshold and got locked for 15
+minutes, that counter stayed frozen at 5 for as long as the account kept
+failing to log in — which meant the very next wrong-password attempt
+after the lock naturally expired computed nextCount = 5 + 1 = 6 (still
+>= the threshold), silently re-locking for another full 15-minute
+window. This repeats on every subsequent attempt that isn't the correct
+password, so in practice a locked account stays locked indefinitely
+unless the very first attempt after each expiry happens to be correct.
+
+Fix: when a login request arrives for an account whose locked_until has
+genuinely passed, that's treated as a fresh start — the counter resets
+to 0 (and locked_until clears) before this attempt is evaluated, so a
+wrong guess right after expiry counts as failure #1, not #6.
+
+Reproduced the exact bug against a live database with a standalone
+script before writing the fix (5 failures -> simulate expiry -> one more
+wrong guess -> confirmed it immediately re-locked under the old code's
+logic), then confirmed the fix resolves it the same way.
+
+Also, per direct request: locked accounts are now visible in the Active
+Accounts admin screen. AUTH-11 lockouts are informational metadata on
+top of ACTIVE status (a locked account isn't deactivated, it just can't
+log in for a bit) — added lockedUntil to the ManagedAccount shape
+(listActiveAccounts, searchAccounts, getMyProfile), server-side filtered
+to only ever surface it while still actually in effect (an expired lock
+is stale data cleared lazily on next login attempt, not proactively, so
+the API doesn't present it as if it were current). Client: a new
+'Locked' badge appears next to the status pill in both the account list
+row and the click-through detail modal, with a hover tooltip explaining
+what triggered it and the exact unlock time.
+
+Tests: T-108b reproduces the exact reported bug end-to-end through the
+real HTTP/service layer (5 failures, simulate expiry, one more wrong
+guess must NOT re-lock, counter must read exactly 1, correct password
+must then work) — this is the regression test that would have caught
+the original bug. T-144 confirms lockedUntil surfaces correctly in both
+the Active Accounts list and search while a lock is genuinely active,
+and disappears once it's expired.
+
+Verified against a real local Postgres: tsc --noEmit clean on both
+sides, production build clean, full suite — all 7 files, 151/151 tests
+— passes.
+---
+ client/.gitignore                             |  1 +
+ .../src/features/auth/AdminAccountsScreen.tsx | 47 ++++++++++------
+ client/src/features/auth/api.ts               |  1 +
+ server/src/features/auth/service.ts           | 39 ++++++++++----
+ server/tests/auth.test.ts                     | 53 +++++++++++++++++++
+ 5 files changed, 115 insertions(+), 26 deletions(-)
+ create mode 100644 client/.gitignore
+
+diff --git a/client/.gitignore b/client/.gitignore
+new file mode 100644
+index 0000000..cc1b7f1
+--- /dev/null
++++ b/client/.gitignore
+@@ -0,0 +1 @@
++tsconfig.tsbuildinfo
+diff --git a/client/src/features/auth/AdminAccountsScreen.tsx b/client/src/features/auth/AdminAccountsScreen.tsx
+index 2ad310f..d0a8424 100644
+--- a/client/src/features/auth/AdminAccountsScreen.tsx
++++ b/client/src/features/auth/AdminAccountsScreen.tsx
+@@ -241,15 +241,7 @@ function ActiveAccountsTab({ onError, onNotice, readOnly }: { onError: (m: strin
+                   </td>
+                   <td style={td}><span style={badge}>{a.role}</span></td>
+                   <td style={td}><Highlight text={a.contactNumber} term={activeSearchTerm} /></td>
+-                  <td style={td}>
+-                    {a.status === 'ACTIVE' ? (
+-                      <span style={statusBadge.active}>Active</span>
+-                    ) : (
+-                      <span style={statusBadge.deactivated}>
+-                        Deactivated{a.deactivatedUntil ? ` until ${new Date(a.deactivatedUntil).toLocaleString()}` : ' (indefinite)'}
+-                      </span>
+-                    )}
+-                  </td>
++                  <td style={td}><StatusDisplay a={a} /></td>
+                   {!readOnly && (
+                     <td style={{ ...td, textAlign: 'right', whiteSpace: 'nowrap' }} onClick={(e) => e.stopPropagation()}>
+                       {a.status === 'ACTIVE' ? (
+@@ -309,6 +301,33 @@ function ActiveAccountsTab({ onError, onNotice, readOnly }: { onError: (m: strin
+   );
+ }
+ 
++// Active/Deactivated status, plus a separate "Locked" badge (AUTH-11) when
++// applicable — a locked account is still ACTIVE from the account-management
++// point of view, this is purely "too many recent wrong password attempts,
++// temporarily can't log in," so it's shown alongside the status rather than
++// replacing it. Hover for the explanation and exact unlock time.
++function StatusDisplay({ a }: { a: ManagedAccount }) {
++  return (
++    <>
++      {a.status === 'ACTIVE' ? (
++        <span style={statusBadge.active}>Active</span>
++      ) : (
++        <span style={statusBadge.deactivated}>
++          Deactivated{a.deactivatedUntil ? ` until ${new Date(a.deactivatedUntil).toLocaleString()}` : ' (indefinite)'}
++        </span>
++      )}
++      {a.lockedUntil && (
++        <span
++          style={statusBadge.locked}
++          title={`Temporarily locked after repeated failed login attempts. Unlocks automatically at ${new Date(a.lockedUntil).toLocaleString()}.`}
++        >
++          Locked
++        </span>
++      )}
++    </>
++  );
++}
++
+ function Highlight({ text, term }: { text: string; term: string }) {
+   if (!term) return <>{text}</>;
+   const idx = text.toLowerCase().indexOf(term.toLowerCase());
+@@ -337,14 +356,7 @@ function AccountDetailModal({ account: a, onClose }: { account: ManagedAccount;
+   return (
+     <Modal title={`Account Details — ${a.fullName}`} onClose={onClose}>
+       <div style={{ marginBottom: 14 }}>
+-        <span style={badge}>{a.role}</span>{' '}
+-        {a.status === 'ACTIVE' ? (
+-          <span style={statusBadge.active}>Active</span>
+-        ) : (
+-          <span style={statusBadge.deactivated}>
+-            Deactivated{a.deactivatedUntil ? ` until ${new Date(a.deactivatedUntil).toLocaleString()}` : ' (indefinite)'}
+-          </span>
+-        )}
++        <span style={badge}>{a.role}</span> <StatusDisplay a={a} />
+       </div>
+       {rows.map(([label, value]) => (
+         <div key={label} style={detailRow}>
+@@ -700,6 +712,7 @@ const markStyle: React.CSSProperties = { background: '#fff3b0', padding: '0 1px'
+ const statusBadge = {
+   active: { font: '600 11px var(--font-mono)', padding: '3px 8px', borderRadius: 4, background: '#e6f4ec', color: '#1f7a45' } as React.CSSProperties,
+   deactivated: { font: '600 11px var(--font-mono)', padding: '3px 8px', borderRadius: 4, background: '#fbe9e7', color: '#b3352b', display: 'inline-block' } as React.CSSProperties,
++  locked: { font: '600 11px var(--font-mono)', padding: '3px 8px', borderRadius: 4, background: '#fdf1e3', color: '#9a6412', display: 'inline-block', marginLeft: 6, cursor: 'help' } as React.CSSProperties,
+ };
+ 
+ const overlay: React.CSSProperties = { position: 'fixed', inset: 0, background: 'rgba(15,27,45,0.45)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000 };
+diff --git a/client/src/features/auth/api.ts b/client/src/features/auth/api.ts
+index f853529..b0dae63 100644
+--- a/client/src/features/auth/api.ts
++++ b/client/src/features/auth/api.ts
+@@ -53,6 +53,7 @@ export interface ManagedAccount {
+   createdAt: string;
+   deactivatedAt?: string;
+   deactivatedUntil?: string; // absent = indefinite ("until reactivated")
++  lockedUntil?: string; // AUTH-11: present = temporarily locked from repeated failed logins
+   enrollmentNo?: string;
+   department?: string;
+   programTitle?: string;
+diff --git a/server/src/features/auth/service.ts b/server/src/features/auth/service.ts
+index 78ba2ff..c067fec 100644
+--- a/server/src/features/auth/service.ts
++++ b/server/src/features/auth/service.ts
+@@ -164,15 +164,27 @@ export async function login(email: string, password: string, ip?: string): Promi
+   }
+ 
+   // AUTH-11: locked out?
+-  if (user.locked_until && new Date(user.locked_until) > new Date()) {
+-    await recordAttempt(false);
+-    throw new AppError(423, 'Account temporarily locked. Try again later.', 'LOCKED');
++  let effectiveFailedCount = user.failed_login_count;
++  if (user.locked_until) {
++    if (new Date(user.locked_until) > new Date()) {
++      await recordAttempt(false);
++      throw new AppError(423, 'Account temporarily locked. Try again later.', 'LOCKED');
++    }
++    // The lock has genuinely expired. Without this reset, a single wrong
++    // guess on the very next attempt would compute nextCount = 5 + 1 = 6,
++    // which is still >= LOCKOUT_THRESHOLD — re-locking for another full
++    // window immediately, and again after that, indefinitely, since
++    // failed_login_count was otherwise only ever cleared on a SUCCESSFUL
++    // login. An expired lock is a fresh start, not a continuation.
++    await db.updateTable('app_user').set({ failed_login_count: 0, locked_until: null })
++      .where('user_id', '=', user.user_id).execute();
++    effectiveFailedCount = 0;
+   }
+ 
+   const ok = await bcrypt.compare(password, user.password_hash);
+   if (!ok) {
+     await recordAttempt(false);
+-    const nextCount = user.failed_login_count + 1;
++    const nextCount = effectiveFailedCount + 1;
+     // AUTH-11: 5 consecutive failures -> lockout with cooldown
+     if (nextCount >= LOCKOUT_THRESHOLD) {
+       await db.updateTable('app_user')
+@@ -544,6 +556,7 @@ export interface ManagedAccount {
+   createdAt: string;
+   deactivatedAt?: string;
+   deactivatedUntil?: string; // absent = indefinite, present = auto-reactivates then
++  lockedUntil?: string; // AUTH-11: present + still in the future = temporarily locked out from repeated failed logins
+   enrollmentNo?: string;
+   department?: string;
+   programTitle?: string;
+@@ -554,15 +567,22 @@ export interface ManagedAccount {
+ function mapManagedAccountRow(r: {
+   user_id: string; role: UserRole; status: string; full_name: string; email: string;
+   contact_number: string; created_at: unknown; deactivated_at: unknown; deactivated_until: unknown;
++  locked_until?: unknown;
+   enrollment_no: string | null; department: string | null; program_title: string | null;
+   institution_name: string | null; designation: string | null;
+ }): ManagedAccount {
++  const lockedUntilDate = r.locked_until ? new Date(r.locked_until as string) : null;
+   return {
+     userId: r.user_id, role: r.role, status: r.status as 'ACTIVE' | 'DEACTIVATED',
+     fullName: r.full_name, email: r.email, contactNumber: r.contact_number,
+     createdAt: new Date(r.created_at as string).toISOString(),
+     deactivatedAt: r.deactivated_at ? new Date(r.deactivated_at as string).toISOString() : undefined,
+     deactivatedUntil: r.deactivated_until ? new Date(r.deactivated_until as string).toISOString() : undefined,
++    // Only surface it while it's still actually in effect — an expired
++    // lock is stale data (cleared lazily on the account's next login
++    // attempt, not proactively), so treat it the same as "not locked"
++    // here rather than showing a misleading permanent-looking timestamp.
++    lockedUntil: lockedUntilDate && lockedUntilDate.getTime() > Date.now() ? lockedUntilDate.toISOString() : undefined,
+     enrollmentNo: r.enrollment_no ?? undefined,
+     department: r.department ?? undefined,
+     programTitle: r.program_title ?? undefined,
+@@ -586,7 +606,7 @@ export async function listActiveAccounts(role?: UserRole): Promise<ManagedAccoun
+     .leftJoin('external_profile as ep', 'ep.user_id', 'u.user_id')
+     .select([
+       'u.user_id', 'u.role', 'u.status', 'u.full_name', 'u.email', 'u.contact_number',
+-      'u.created_at', 'u.deactivated_at', 'u.deactivated_until',
++      'u.created_at', 'u.deactivated_at', 'u.deactivated_until', 'u.locked_until',
+       'sp.enrollment_no', 'sp.department', 'sp.program_title',
+       'ep.institution_name', 'ep.designation',
+     ])
+@@ -609,7 +629,7 @@ export async function getMyProfile(userId: string): Promise<ManagedAccount> {
+     .leftJoin('external_profile as ep', 'ep.user_id', 'u.user_id')
+     .select([
+       'u.user_id', 'u.role', 'u.status', 'u.full_name', 'u.email', 'u.contact_number',
+-      'u.created_at', 'u.deactivated_at', 'u.deactivated_until',
++      'u.created_at', 'u.deactivated_at', 'u.deactivated_until', 'u.locked_until',
+       'sp.enrollment_no', 'sp.department', 'sp.program_title',
+       'ep.institution_name', 'ep.designation',
+     ])
+@@ -646,13 +666,14 @@ export async function searchAccounts(term: string, role: UserRole | undefined, l
+   const rows = await sql<{
+     user_id: string; role: UserRole; status: string; full_name: string; email: string;
+     contact_number: string; created_at: string; deactivated_at: string | null; deactivated_until: string | null;
++    locked_until: string | null;
+     enrollment_no: string | null; department: string | null; program_title: string | null;
+     institution_name: string | null; designation: string | null; match_rank: number;
+   }>`
+     SELECT * FROM (
+       SELECT
+         u.user_id, u.role, u.status, u.full_name, u.email, u.contact_number,
+-        u.created_at, u.deactivated_at, u.deactivated_until,
++        u.created_at, u.deactivated_at, u.deactivated_until, u.locked_until,
+         sp.enrollment_no, sp.department, sp.program_title,
+         NULL::text AS institution_name, NULL::text AS designation,
+         LEAST(
+@@ -681,7 +702,7 @@ export async function searchAccounts(term: string, role: UserRole | undefined, l
+ 
+       SELECT
+         u.user_id, u.role, u.status, u.full_name, u.email, u.contact_number,
+-        u.created_at, u.deactivated_at, u.deactivated_until,
++        u.created_at, u.deactivated_at, u.deactivated_until, u.locked_until,
+         NULL::text, NULL::text, NULL::text,
+         ep.institution_name, ep.designation,
+         LEAST(
+@@ -708,7 +729,7 @@ export async function searchAccounts(term: string, role: UserRole | undefined, l
+ 
+       SELECT
+         u.user_id, u.role, u.status, u.full_name, u.email, u.contact_number,
+-        u.created_at, u.deactivated_at, u.deactivated_until,
++        u.created_at, u.deactivated_at, u.deactivated_until, u.locked_until,
+         NULL::text, NULL::text, NULL::text, NULL::text, NULL::text,
+         LEAST(
+           CASE WHEN lower(u.full_name) = lower(${raw}) OR lower(u.email) = lower(${raw})
+diff --git a/server/tests/auth.test.ts b/server/tests/auth.test.ts
+index a7fb41b..92f498f 100644
+--- a/server/tests/auth.test.ts
++++ b/server/tests/auth.test.ts
+@@ -172,6 +172,35 @@ describe('Login & lockout (AUTH-08/11/14)', () => {
+     expect(res.body.code).toBe('LOCKED');
+   });
+ 
++  it('T-108b AUTH-11: a lock that has genuinely expired resets the failure counter — a single wrong guess right after expiry does NOT immediately re-lock', async () => {
++    const { agent } = await superAdminAgent();
++    const reg = await registerStudent({ password: 'RightPass1' });
++    const userId = reg.body.user.userId;
++    await agent.post('/api/auth/admin/verify').send({ userId });
++    for (let i = 0; i < 5; i++) await loginAs(reg.body.user.email, 'WrongPass');
++    const stillLocked = await loginAs(reg.body.user.email, 'RightPass1');
++    expect(stillLocked.status).toBe(423);
++
++    // Simulate the 15-minute window having genuinely elapsed.
++    await db.updateTable('app_user').set({ locked_until: new Date(Date.now() - 1000) })
++      .where('user_id', '=', userId).execute();
++
++    // A wrong guess right after expiry must NOT re-lock immediately — without
++    // the counter reset, nextCount would be 5+1=6 (still >= threshold),
++    // re-locking for another full window on every subsequent attempt forever.
++    const wrongAfterExpiry = await loginAs(reg.body.user.email, 'StillWrong');
++    expect(wrongAfterExpiry.status).toBe(401); // plain "invalid", not 423 locked
++
++    const row = await db.selectFrom('app_user').select(['failed_login_count', 'locked_until'])
++      .where('user_id', '=', userId).executeTakeFirst();
++    expect(row?.failed_login_count).toBe(1); // reset to 0, then this one failure counted
++    expect(row?.locked_until).toBeNull();
++
++    // And the correct password now works normally.
++    const success = await loginAs(reg.body.user.email, 'RightPass1');
++    expect(success.status).toBe(200);
++  });
++
+   it('T-109: wrong password gives the same message as unknown email (no enumeration)', async () => {
+     const unknown = await loginAs('nobody@bukc.edu.pk', 'x');
+     expect(unknown.status).toBe(401);
+@@ -833,4 +862,28 @@ describe('Account management — deactivate/reactivate/delete/search', () => {
+       .send({ fullName: 'Nope', email: uniqueEmail('nope'), contactNumber: '03001112222' });
+     expect(inviteRes.status).toBe(403);
+   });
++
++  it('T-144 AUTH-11: a locked account shows lockedUntil in the Active Accounts list and search, and it disappears once the lock expires', async () => {
++    const { agent, userId, email } = await activeStudent();
++    for (let i = 0; i < 5; i++) await loginAs(email, 'WrongPass');
++
++    const list = await agent.get('/api/auth/admin/accounts');
++    const row = list.body.accounts.find((a: { userId: string }) => a.userId === userId);
++    expect(row.lockedUntil).toBeTruthy();
++    expect(new Date(row.lockedUntil).getTime()).toBeGreaterThan(Date.now());
++
++    const search = await agent.get(`/api/auth/admin/accounts/search?q=${encodeURIComponent(email)}`);
++    const searchRow = search.body.accounts.find((a: { userId: string }) => a.userId === userId);
++    expect(searchRow.lockedUntil).toBeTruthy();
++
++    // Simulate expiry — the DB row still has a (now-past) locked_until until
++    // the account's own next login attempt lazily clears it, but the API
++    // must not present stale/expired lock data as if it were still in effect.
++    await db.updateTable('app_user').set({ locked_until: new Date(Date.now() - 1000) })
++      .where('user_id', '=', userId).execute();
++
++    const listAfter = await agent.get('/api/auth/admin/accounts');
++    const rowAfter = listAfter.body.accounts.find((a: { userId: string }) => a.userId === userId);
++    expect(rowAfter.lockedUntil).toBeUndefined();
++  });
+ });
+-- 
+2.43.0
+

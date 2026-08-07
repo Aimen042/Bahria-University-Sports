@@ -1,0 +1,1192 @@
+From 746a98743dcf01dcac23cee539b43415e362e7c8 Mon Sep 17 00:00:00 2001
+From: Raza <raza@bukc.edu.pk>
+Date: Wed, 29 Jul 2026 00:19:45 +0000
+Subject: [PATCH] feat(auth): OTP-based password reset/change, coordinator
+ invite hard-delete
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Two features, both explicitly requested.
+
+1. PASSWORD RESET/CHANGE MOVE TO EMAIL OTP (GitHub-'Verify via email'-style,
+   per the screenshots). This deliberately deviates from AUTH-18's literal
+   wording ('reset link') — a knowing product decision, not a bug, so noting
+   it plainly rather than silently diverging from the documented rule.
+
+   New crypto primitives (tokens.ts): generateOtp() (crypto-secure 8-digit
+   code) and hashOtp() — an HMAC keyed with the server secret, not the plain
+   SHA-256 used for the existing 256-bit tokens. An 8-digit code has ~26.6
+   bits of entropy; a DB dump alone could exhaustively hash every possible
+   code in well under a second against a plain hash, so the HMAC key raises
+   the bar to 'dump AND server secret', not 'dump alone'.
+
+   Migration 018 adds purpose ('RESET' | 'CHANGE_CONFIRM') and
+   failed_attempts to the existing password_reset_token table — same shape,
+   reused for both flows.
+
+   Forgot Password (AUTH-18): step 1 emails an 8-digit code instead of a
+   link; step 2 takes {email, otp, newPassword} instead of {token,
+   newPassword}. Same anti-enumeration (step 2 gives the identical generic
+   error for an unknown email, a wrong code, or both), same rate limiting,
+   same 'only the latest code works' as the link version had.
+
+   Change Password (AUTH-17) becomes two-step: request-otp (verifies
+   current password, emails a confirmation code) then confirm (applies the
+   change). Still explicitly NOT an email-link flow — a logged-in user's
+   current password remains the primary identity proof; the OTP is a
+   step-up confirmation on top of it, not a replacement for it.
+
+   New: guess-limiting independent of the request-issuing rate limit — 5
+   wrong attempts burns the current code, same as GitHub's own pattern,
+   necessary once the token became human-guessable-length instead of a
+   256-bit random string.
+
+   Client: PasswordResetScreens.tsx is now a single two-step screen (email,
+   then code+password) instead of email-then-separate-link-landing-page;
+   the old /reset-password?token= route now just redirects, so anyone with
+   a stale bookmarked link doesn't hit a dead end. ProfileScreen's Change
+   Password card does the matching two-step dance.
+
+   Added a devOtp response field outside production, mirroring the
+   existing devToken convention for coordinator invites — necessary since
+   EMAIL_PROVIDER=console can't be inspected by a test client the way a
+   real inbox can; verified end-to-end against a real database (wrong-OTP
+   rejection, correct-OTP success, session kill, guess-limit burn) before
+   writing a single test against it.
+
+2. COORDINATOR INVITE AUDIT LOG: HARD DELETE. Confirmed nothing else in the
+   schema references coordinator_invite, so a real DELETE is safe — unlike
+   app_user, which needs the soft-delete dance because it's referenced
+   everywhere. Deleting an invite record never touches the invited user's
+   actual account, whether they accepted, are still pending, or the invite
+   expired unused.
+
+Tests: rewrote every password test to the new two-step API shape (14
+tests total in that describe block now, up from 6), plus 4 new tests for
+the invite hard-delete (including confirming an already-accepted
+coordinator's account survives deleting their invite record, and that
+delete is genuinely a hard delete — the row is gone, not soft-flagged).
+Caught and fixed two bugs in my own draft tests along the way (missing
+account verification before a login assertion; a wrong-guess loop that
+used an invalid password format, which meant the requests were failing
+schema validation before ever reaching the OTP-check logic they were
+supposed to be exercising — confirmed via a standalone debug script that
+called the service functions directly, bypassing HTTP/Zod, which proved
+the actual service logic was correct all along).
+
+Verified against a real local Postgres: migrations 001-018 apply
+cleanly, seed runs, tsc --noEmit clean on both sides, full suite —
+all 7 files, 149/149 tests — passes with zero flakes this run.
+---
+ .../src/features/auth/AdminAccountsScreen.tsx |  34 ++-
+ .../features/auth/PasswordResetScreens.tsx    | 132 ++++++-----
+ client/src/features/auth/ProfileScreen.tsx    |  52 ++++-
+ client/src/features/auth/api.ts               |  21 +-
+ db/migrations/018_password_otp.sql            |  26 +++
+ server/src/db/index.ts                        |   2 +
+ server/src/features/auth/router.ts            |  29 ++-
+ server/src/features/auth/service.ts           | 210 +++++++++++-------
+ server/src/features/auth/validators.ts        |  10 +-
+ server/src/lib/tokens.ts                      |  21 +-
+ server/tests/auth.test.ts                     | 189 ++++++++++++----
+ 11 files changed, 499 insertions(+), 227 deletions(-)
+ create mode 100644 db/migrations/018_password_otp.sql
+
+diff --git a/client/src/features/auth/AdminAccountsScreen.tsx b/client/src/features/auth/AdminAccountsScreen.tsx
+index 091e461..2ad310f 100644
+--- a/client/src/features/auth/AdminAccountsScreen.tsx
++++ b/client/src/features/auth/AdminAccountsScreen.tsx
+@@ -17,7 +17,7 @@
+  */
+ import { useEffect, useState, useCallback, useRef, type FormEvent } from 'react';
+ import {
+-  listPending, verifyAccount, rejectAccount, inviteCoordinator, listCoordinatorInvites,
++  listPending, verifyAccount, rejectAccount, inviteCoordinator, listCoordinatorInvites, deleteCoordinatorInvite,
+   listActiveAccounts, searchAccounts, deactivateAccount, reactivateAccount, deleteAccountPermanently,
+   type PendingAccount, type ManagedAccount, type CoordinatorInviteRecord,
+ } from './api.js';
+@@ -589,13 +589,13 @@ function InviteCoordinator({ onDone, onError }: { onDone: (m: string) => void; o
+ // accepted, still pending, or expired unused.
+ function CoordinatorInviteLog({ onError }: { onError: (m: string) => void }) {
+   const [invites, setInvites] = useState<CoordinatorInviteRecord[] | null>(null);
++  const [deleting, setDeleting] = useState<CoordinatorInviteRecord | null>(null);
+ 
+-  useEffect(() => {
+-    (async () => {
+-      try { const res = await listCoordinatorInvites(); setInvites(res.invites); }
+-      catch (e) { onError(errMsg(e)); }
+-    })();
++  const load = useCallback(async () => {
++    try { const res = await listCoordinatorInvites(); setInvites(res.invites); }
++    catch (e) { onError(errMsg(e)); }
+   }, [onError]);
++  useEffect(() => { void load(); }, [load]);
+ 
+   return (
+     <Panel title="Coordinator Invitations Sent">
+@@ -606,7 +606,7 @@ function CoordinatorInviteLog({ onError }: { onError: (m: string) => void }) {
+       ) : (
+         <table style={table}>
+           <thead>
+-            <tr><th style={th}>Name</th><th style={th}>Email</th><th style={th}>Invited By</th><th style={th}>Sent</th><th style={th}>Status</th></tr>
++            <tr><th style={th}>Name</th><th style={th}>Email</th><th style={th}>Invited By</th><th style={th}>Sent</th><th style={th}>Status</th><th style={th} /></tr>
+           </thead>
+           <tbody>
+             {invites.map((i) => (
+@@ -616,11 +616,31 @@ function CoordinatorInviteLog({ onError }: { onError: (m: string) => void }) {
+                 <td style={td}>{i.invitedByName}</td>
+                 <td style={td}>{new Date(i.issuedAt).toLocaleString()}</td>
+                 <td style={td}><span style={{ ...badge, ...inviteStatusStyle(i.status) }}>{i.status}</span></td>
++                <td style={{ ...td, textAlign: 'right' }}>
++                  <button style={{ ...linkBtn, color: 'var(--danger, #c0392b)' }} onClick={() => setDeleting(i)}>Delete</button>
++                </td>
+               </tr>
+             ))}
+           </tbody>
+         </table>
+       )}
++
++      {deleting && (
++        <ConfirmModal
++          title="Delete Invite Record"
++          danger
++          confirmLabel="Delete Permanently"
++          message={`This permanently removes the invite record for ${deleting.fullName} (${deleting.email}) from the log. This is a hard delete — it cannot be undone. It does NOT affect their account if they already accepted the invite.`}
++          onCancel={() => setDeleting(null)}
++          onConfirm={async () => {
++            try {
++              await deleteCoordinatorInvite(deleting.inviteId);
++              setDeleting(null);
++              void load();
++            } catch (e) { onError(errMsg(e)); setDeleting(null); }
++          }}
++        />
++      )}
+     </Panel>
+   );
+ }
+diff --git a/client/src/features/auth/PasswordResetScreens.tsx b/client/src/features/auth/PasswordResetScreens.tsx
+index 39ecdac..b9ad011 100644
+--- a/client/src/features/auth/PasswordResetScreens.tsx
++++ b/client/src/features/auth/PasswordResetScreens.tsx
+@@ -1,27 +1,53 @@
+ /**
+- * Forgot-password and reset-password screens, styled to match the BUKC portal
+- * (screenshot 4). No CAPTCHA (per project). Forgot-password always returns the
+- * same message whether or not the email exists (AUTH-18, no enumeration).
++ * Forgot-password — OTP-based (AUTH-18, deliberately not a link — see the
++ * chat writeup). Two steps on one screen: enter your email, then enter the
++ * 8-digit code that arrives by email alongside your new password. No
++ * CAPTCHA (per project). Step 1 always returns the same message whether or
++ * not the email exists (no enumeration); step 2 gives the same generic
++ * "invalid or expired" error whether the email, the code, or both were
++ * wrong — same principle, applied all the way through.
+  */
+ import { useState, type FormEvent } from 'react';
+-import { Link, useSearchParams, useNavigate } from 'react-router-dom';
+-import { PortalShell, LabeledInput, PrimaryButton, fs, PersonIcon, MailIcon, LockIcon } from './PortalShell.js';
++import { Link, Navigate } from 'react-router-dom';
++import { PortalShell, LabeledInput, PrimaryButton, fs, MailIcon, LockIcon } from './PortalShell.js';
+ import { forgotPassword, resetPassword } from './api.js';
+ import { ApiRequestError } from '../../lib/api.js';
+ 
++function errMsg(e: unknown) { return e instanceof ApiRequestError ? e.body.error : 'Something went wrong.'; }
++
+ export function ForgotPasswordScreen() {
++  const [step, setStep] = useState<'email' | 'code'>('email');
+   const [email, setEmail] = useState('');
+-  const [done, setDone] = useState<string | null>(null);
++  const [otp, setOtp] = useState('');
++  const [newPassword, setNewPassword] = useState('');
++  const [confirmPassword, setConfirmPassword] = useState('');
++  const [error, setError] = useState<string | null>(null);
++  const [done, setDone] = useState(false);
+   const [loading, setLoading] = useState(false);
+ 
+-  async function onSubmit(e: FormEvent) {
++  async function onSubmitEmail(e: FormEvent) {
+     e.preventDefault();
+     setLoading(true);
+     try {
+-      const res = await forgotPassword(email);
+-      setDone(res.message);
++      await forgotPassword(email);
+     } catch {
+-      setDone('If that email is registered, a reset link is on its way.');
++      // still advance — the response is deliberately identical either way
++    } finally {
++      setLoading(false);
++      setStep('code');
++    }
++  }
++
++  async function onSubmitCode(e: FormEvent) {
++    e.preventDefault();
++    setError(null);
++    if (newPassword !== confirmPassword) { setError('New password and confirmation do not match.'); return; }
++    setLoading(true);
++    try {
++      await resetPassword(email, otp, newPassword);
++      setDone(true);
++    } catch (err) {
++      setError(errMsg(err));
+     } finally {
+       setLoading(false);
+     }
+@@ -33,12 +59,15 @@ export function ForgotPasswordScreen() {
+         <div style={panelHead}>Forgot Password</div>
+         <div style={panelBody}>
+           {done ? (
+-            <div style={okBox}>{done}</div>
+-          ) : (
+-            <form onSubmit={onSubmit} noValidate style={fs.formCol}>
++            <div>
++              <div style={okBox}>Password reset. You can now sign in.</div>
++              <Link to="/" style={{ ...link, display: 'inline-block', marginTop: 14 }}>Back to Login</Link>
++            </div>
++          ) : step === 'email' ? (
++            <form onSubmit={onSubmitEmail} noValidate style={fs.formCol}>
+               <p style={{ color: '#777', fontSize: 14, lineHeight: 1.6, marginTop: 0 }}>
+-                Provide your registered email address. We'll send you a link to reset your password.
+-                The link expires in 15 minutes.
++                Provide your registered email address. We'll send you an 8-digit code to reset your password.
++                The code expires in 15 minutes and can only be used once.
+               </p>
+               <LabeledInput label="Email:" icon={<MailIcon />} type="email" placeholder="Email Address"
+                 value={email} onChange={(e) => setEmail(e.target.value)} required />
+@@ -49,64 +78,23 @@ export function ForgotPasswordScreen() {
+                 <Link to="/" style={link}>Back to Login</Link>
+               </div>
+             </form>
+-          )}
+-        </div>
+-      </div>
+-    </PortalShell>
+-  );
+-}
+-
+-export function ResetPasswordScreen() {
+-  const [params] = useSearchParams();
+-  const navigate = useNavigate();
+-  const token = params.get('token') ?? '';
+-  const [newPassword, setNewPassword] = useState('');
+-  const [error, setError] = useState<string | null>(null);
+-  const [done, setDone] = useState(false);
+-  const [loading, setLoading] = useState(false);
+-
+-  async function onSubmit(e: FormEvent) {
+-    e.preventDefault();
+-    setError(null); setLoading(true);
+-    try {
+-      await resetPassword(token, newPassword);
+-      setDone(true);
+-      setTimeout(() => navigate('/'), 1600);
+-    } catch (err) {
+-      setError(err instanceof ApiRequestError ? err.body.error : 'Could not reset the password.');
+-    } finally {
+-      setLoading(false);
+-    }
+-  }
+-
+-  if (!token) {
+-    return (
+-      <PortalShell title="Reset Password" tint="sage">
+-        <div style={panel}><div style={panelBody}>
+-          <div style={errBox}>This reset link is missing its token. Request a new one.</div>
+-          <Link to="/forgot-password" style={link}>Request a new link</Link>
+-        </div></div>
+-      </PortalShell>
+-    );
+-  }
+-
+-  return (
+-    <PortalShell title="Reset Password" tint="sage">
+-      <div style={panel}>
+-        <div style={panelHead}>Set a New Password</div>
+-        <div style={panelBody}>
+-          {done ? (
+-            <div style={okBox}>Password reset. Taking you to sign in…</div>
+           ) : (
+-            <form onSubmit={onSubmit} noValidate style={fs.formCol}>
++            <form onSubmit={onSubmitCode} noValidate style={fs.formCol}>
+               {error && <div style={errBox}>{error}</div>}
+-              <LabeledInput label="New Password:" icon={<LockIcon />} type="password" placeholder="At least 8 characters"
++              <p style={{ color: '#777', fontSize: 14, lineHeight: 1.6, marginTop: 0 }}>
++                Enter the code sent to <strong>{email}</strong>. If it doesn't appear within a few minutes, check your spam folder.
++              </p>
++              <LabeledInput label="8-digit code:" icon={<LockIcon />} placeholder="XXXXXXXX"
++                inputMode="numeric" maxLength={8} value={otp} onChange={(e) => setOtp(e.target.value.replace(/\D/g, ''))} required />
++              <LabeledInput label="New password:" icon={<LockIcon />} type="password" placeholder="At least 8 characters"
+                 autoComplete="new-password" value={newPassword} onChange={(e) => setNewPassword(e.target.value)} required />
+-              <div style={{ display: 'flex', alignItems: 'center', gap: 16, marginTop: 8 }}>
++              <LabeledInput label="Confirm new password:" icon={<LockIcon />} type="password" placeholder="Repeat new password"
++                autoComplete="new-password" value={confirmPassword} onChange={(e) => setConfirmPassword(e.target.value)} required />
++              <div style={{ display: 'flex', alignItems: 'center', gap: 16, marginTop: 8, flexWrap: 'wrap' }}>
+                 <PrimaryButton type="submit" disabled={loading} style={{ width: 'auto', padding: '10px 28px' }}>
+-                  {loading ? 'Resetting…' : 'Submit'}
++                  {loading ? 'Resetting…' : 'Verify & Reset'}
+                 </PrimaryButton>
+-                <Link to="/" style={link}>Back to Login</Link>
++                <button type="button" style={linkBtn} onClick={() => setStep('email')}>Use a different email / resend code</button>
+               </div>
+             </form>
+           )}
+@@ -116,9 +104,17 @@ export function ResetPasswordScreen() {
+   );
+ }
+ 
++// Anyone who still has an old, bookmarked link-based reset URL from before
++// this change lands here instead of an error — the OTP flow above is the
++// only path forward now.
++export function ResetPasswordScreen() {
++  return <Navigate to="/forgot-password" replace />;
++}
++
+ const panel: React.CSSProperties = { maxWidth: 640, margin: '0 auto', background: '#fff', border: '1px solid #ddd', borderRadius: 4, boxShadow: '0 1px 2px rgba(0,0,0,0.05)' };
+ const panelHead: React.CSSProperties = { padding: '14px 20px', borderBottom: '1px solid #e5e5e5', font: '600 16px var(--font-body)', color: '#333', background: 'linear-gradient(#fff,#f7f7f7)' };
+ const panelBody: React.CSSProperties = { padding: 24 };
+ const link: React.CSSProperties = { color: '#0a6ebd', textDecoration: 'none', fontSize: 14 };
++const linkBtn: React.CSSProperties = { background: 'none', border: 'none', color: '#0a6ebd', fontSize: 13.5, cursor: 'pointer', padding: 0 };
+ const okBox: React.CSSProperties = { background: '#eaf6ee', color: '#1e6b3a', border: '1px solid #c2e6cd', borderRadius: 4, padding: '12px 14px', fontSize: 14.5 };
+ const errBox: React.CSSProperties = { background: '#fdecec', color: '#8f2323', border: '1px solid #f3caca', borderRadius: 4, padding: '10px 12px', marginBottom: 14, fontSize: 14 };
+diff --git a/client/src/features/auth/ProfileScreen.tsx b/client/src/features/auth/ProfileScreen.tsx
+index d728c76..284a75d 100644
+--- a/client/src/features/auth/ProfileScreen.tsx
++++ b/client/src/features/auth/ProfileScreen.tsx
+@@ -11,7 +11,7 @@ import { useEffect, useState, useCallback, type FormEvent } from 'react';
+ import { useNavigate } from 'react-router-dom';
+ import { useAuth } from '../../lib/auth.js';
+ import { PortalShell, LabeledInput, PrimaryButton, LockIcon, type BarTint } from './PortalShell.js';
+-import { getMyProfile, changePassword, type ManagedAccount } from './api.js';
++import { getMyProfile, requestChangePasswordOtp, confirmChangePassword, type ManagedAccount } from './api.js';
+ import { listNotifications, unreadNotificationCount, markNotificationRead, markAllNotificationsRead, type AppNotification } from '../notifications/api.js';
+ import { getReputation, listMyRequests, type MyRequest, type Reputation } from '../borrow/api.js';
+ import { listMyBookings, type MyBooking } from '../venue/api.js';
+@@ -156,20 +156,38 @@ function PersonalDetails({ account: a }: { account: ManagedAccount }) {
+ }
+ 
+ // ── Change password (AUTH-17) ──
++// AUTH-17, two-step: fill current+new+confirm, submit sends an OTP to your
++// email (step-up confirmation, GitHub-"Verify via email"-style); entering
++// that code actually applies the change.
+ function ChangePasswordCard({ onDone, onError }: { onDone: (m: string) => void; onError: (m: string) => void }) {
++  const [step, setStep] = useState<'form' | 'code'>('form');
+   const [current, setCurrent] = useState('');
+   const [next, setNext] = useState('');
+   const [confirm, setConfirm] = useState('');
++  const [otp, setOtp] = useState('');
+   const [loading, setLoading] = useState(false);
+ 
+-  async function onSubmit(e: FormEvent) {
++  async function onSubmitForm(e: FormEvent) {
+     e.preventDefault();
+     if (next !== confirm) { onError('New password and confirmation do not match.'); return; }
+     setLoading(true);
+     try {
+-      await changePassword(current, next);
+-      onDone('Password changed.');
+-      setCurrent(''); setNext(''); setConfirm('');
++      await requestChangePasswordOtp(current);
++      setStep('code');
++    } catch (err) {
++      onError(errMsg(err));
++    } finally {
++      setLoading(false);
++    }
++  }
++
++  async function onSubmitCode(e: FormEvent) {
++    e.preventDefault();
++    setLoading(true);
++    try {
++      await confirmChangePassword(otp, next);
++      onDone('Password changed. You may need to sign in again on other devices.');
++      setStep('form'); setCurrent(''); setNext(''); setConfirm(''); setOtp('');
+     } catch (err) {
+       onError(errMsg(err));
+     } finally {
+@@ -179,12 +197,24 @@ function ChangePasswordCard({ onDone, onError }: { onDone: (m: string) => void;
+ 
+   return (
+     <Panel title="Change Password">
+-      <form onSubmit={onSubmit} noValidate style={{ maxWidth: 380 }}>
+-        <LabeledInput label="Current password:" icon={<LockIcon />} type="password" value={current} onChange={(e) => setCurrent(e.target.value)} required />
+-        <LabeledInput label="New password:" icon={<LockIcon />} type="password" value={next} onChange={(e) => setNext(e.target.value)} required />
+-        <LabeledInput label="Confirm new password:" icon={<LockIcon />} type="password" value={confirm} onChange={(e) => setConfirm(e.target.value)} required />
+-        <PrimaryButton type="submit" disabled={loading}>{loading ? 'Saving…' : 'Change Password'}</PrimaryButton>
+-      </form>
++      {step === 'form' ? (
++        <form onSubmit={onSubmitForm} noValidate style={{ maxWidth: 380 }}>
++          <LabeledInput label="Current password:" icon={<LockIcon />} type="password" value={current} onChange={(e) => setCurrent(e.target.value)} required />
++          <LabeledInput label="New password:" icon={<LockIcon />} type="password" value={next} onChange={(e) => setNext(e.target.value)} required />
++          <LabeledInput label="Confirm new password:" icon={<LockIcon />} type="password" value={confirm} onChange={(e) => setConfirm(e.target.value)} required />
++          <PrimaryButton type="submit" disabled={loading}>{loading ? 'Sending code…' : 'Send Confirmation Code'}</PrimaryButton>
++        </form>
++      ) : (
++        <form onSubmit={onSubmitCode} noValidate style={{ maxWidth: 380 }}>
++          <p style={{ ...muted, marginTop: 0 }}>We emailed an 8-digit code to confirm this change. It expires in 15 minutes.</p>
++          <LabeledInput label="Confirmation code:" icon={<LockIcon />} placeholder="XXXXXXXX"
++            inputMode="numeric" maxLength={8} value={otp} onChange={(e) => setOtp(e.target.value.replace(/\D/g, ''))} required />
++          <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
++            <PrimaryButton type="submit" disabled={loading}>{loading ? 'Confirming…' : 'Confirm Change'}</PrimaryButton>
++            <button type="button" style={linkBtn} onClick={() => setStep('form')}>Back</button>
++          </div>
++        </form>
++      )}
+     </Panel>
+   );
+ }
+diff --git a/client/src/features/auth/api.ts b/client/src/features/auth/api.ts
+index ddd1b0d..f853529 100644
+--- a/client/src/features/auth/api.ts
++++ b/client/src/features/auth/api.ts
+@@ -90,17 +90,25 @@ export function forgotPassword(email: string) {
+   return api<{ message: string }>('/api/auth/forgot-password', { method: 'POST', body: { email } });
+ }
+ 
+-export function resetPassword(token: string, newPassword: string) {
++export function resetPassword(email: string, otp: string, newPassword: string) {
+   return api<{ message: string }>('/api/auth/reset-password', {
+     method: 'POST',
+-    body: { token, newPassword },
++    body: { email, otp, newPassword },
+   });
+ }
+ 
+-export function changePassword(currentPassword: string, newPassword: string) {
+-  return api<{ message: string }>('/api/auth/change-password', {
++// AUTH-17, two-step: verify current password + email an OTP, then confirm
++// with that OTP to actually apply the change.
++export function requestChangePasswordOtp(currentPassword: string) {
++  return api<{ message: string }>('/api/auth/change-password/request-otp', {
+     method: 'POST',
+-    body: { currentPassword, newPassword },
++    body: { currentPassword },
++  });
++}
++export function confirmChangePassword(otp: string, newPassword: string) {
++  return api<{ message: string }>('/api/auth/change-password/confirm', {
++    method: 'POST',
++    body: { otp, newPassword },
+   });
+ }
+ 
+@@ -170,3 +178,6 @@ export interface CoordinatorInviteRecord {
+ export function listCoordinatorInvites() {
+   return api<{ invites: CoordinatorInviteRecord[] }>('/api/auth/admin/coordinator-invites');
+ }
++export function deleteCoordinatorInvite(inviteId: string) {
++  return api<{ message: string }>(`/api/auth/admin/coordinator-invites/${inviteId}`, { method: 'DELETE' });
++}
+diff --git a/db/migrations/018_password_otp.sql b/db/migrations/018_password_otp.sql
+new file mode 100644
+index 0000000..e38dca7
+--- /dev/null
++++ b/db/migrations/018_password_otp.sql
+@@ -0,0 +1,26 @@
++-- ============================================================================
++-- 018 — Password reset/change moves from a link token to an email OTP.
++--
++-- Deliberate deviation from AUTH-18's literal text ("reset link") — a
++-- product decision, not a bug: the flow now sends a short numeric code
++-- instead of a clickable link, matching the step-up verification pattern
++-- (see GitHub's "Verify via email" flow). The password_reset_token table
++-- already fit the shape (hash + expiry + single-use); it just needed two
++-- additions:
++--
++-- 1. purpose — distinguishes a forgot-password OTP (unauthenticated,
++--    proves inbox ownership) from a change-password confirmation OTP
++--    (authenticated, a step-up check after the current password was
++--    already verified). Same table, same security properties, different
++--    context.
++-- 2. failed_attempts — an 8-digit OTP has far less entropy than the old
++--    256-bit random token, so guessing needs its own limit independent of
++--    the per-email/per-IP request rate limit (migration 017) — that limits
++--    how many codes get ISSUED, this limits how many guesses a single
++--    issued code tolerates before it's burned and a fresh one is required.
++-- ============================================================================
++
++ALTER TABLE password_reset_token
++  ADD COLUMN purpose text NOT NULL DEFAULT 'RESET'
++    CHECK (purpose IN ('RESET', 'CHANGE_CONFIRM'));
++ALTER TABLE password_reset_token ADD COLUMN failed_attempts int NOT NULL DEFAULT 0;
+diff --git a/server/src/db/index.ts b/server/src/db/index.ts
+index a3cdf0f..d042aa7 100644
+--- a/server/src/db/index.ts
++++ b/server/src/db/index.ts
+@@ -72,6 +72,8 @@ export interface PasswordResetTokenTable {
+   issued_at: Generated<Timestamp>;
+   expires_at: ColumnType<Date, Date | string | undefined, Date | string>;
+   used_at: Timestamp | null;
++  purpose: ColumnType<'RESET' | 'CHANGE_CONFIRM', 'RESET' | 'CHANGE_CONFIRM' | undefined, 'RESET' | 'CHANGE_CONFIRM'>;
++  failed_attempts: ColumnType<number, number | undefined, number>;
+ }
+ 
+ export interface LoginAttemptTable {
+diff --git a/server/src/features/auth/router.ts b/server/src/features/auth/router.ts
+index 5a98e78..ce65d74 100644
+--- a/server/src/features/auth/router.ts
++++ b/server/src/features/auth/router.ts
+@@ -87,22 +87,28 @@ authRouter.post('/logout', asyncHandler(async (req, res) => {
+   res.status(204).end();
+ }));
+ 
+-// ── Self-service password (AUTH-17/18/21) ──
+-authRouter.post('/change-password', requireAuth, asyncHandler(async (req, res) => {
+-  const { currentPassword, newPassword } = parse(v.changePasswordSchema, req.body);
+-  await svc.changePassword(req.user!.userId, currentPassword, newPassword, req.ip);
++// ── Self-service password (AUTH-17/18/21) — OTP-based, see migration 018 ──
++authRouter.post('/change-password/request-otp', requireAuth, asyncHandler(async (req, res) => {
++  const { currentPassword } = parse(v.requestChangeOtpSchema, req.body);
++  const { devOtp } = await svc.requestChangePasswordOtp(req.user!.userId, currentPassword, req.ip);
++  res.json({ devOtp, message: 'A confirmation code has been emailed to you.' });
++}));
++
++authRouter.post('/change-password/confirm', requireAuth, asyncHandler(async (req, res) => {
++  const { otp, newPassword } = parse(v.confirmChangePasswordSchema, req.body);
++  await svc.confirmChangePassword(req.user!.userId, otp, newPassword);
+   res.json({ message: 'Password changed. Please sign in again.' });
+ }));
+ 
+ authRouter.post('/forgot-password', asyncHandler(async (req, res) => {
+   const { email } = parse(v.forgotPasswordSchema, req.body);
+-  await svc.requestPasswordReset(email, clientOrigin(req), req.ip);
+-  res.json({ message: 'If that email is registered, a reset link is on its way.' });
++  const { devOtp } = await svc.requestPasswordReset(email, req.ip);
++  res.json({ devOtp, message: 'If that email is registered, a reset code is on its way.' });
+ }));
+ 
+ authRouter.post('/reset-password', asyncHandler(async (req, res) => {
+-  const { token, newPassword } = parse(v.resetPasswordSchema, req.body);
+-  await svc.resetPassword(token, newPassword);
++  const { email, otp, newPassword } = parse(v.resetPasswordSchema, req.body);
++  await svc.resetPassword(email, otp, newPassword);
+   res.json({ message: 'Password reset. You can now sign in.' });
+ }));
+ 
+@@ -121,6 +127,13 @@ authRouter.get('/admin/coordinator-invites', requireAuth, requireRole('SUPER_ADM
+   res.json({ invites: await svc.listCoordinatorInvites() });
+ }));
+ 
++authRouter.delete('/admin/coordinator-invites/:id', requireAuth, requireRole('SUPER_ADMIN'), asyncHandler(async (req, res) => {
++  const id = req.params.id;
++  if (!id) throw badRequest('Missing id');
++  await svc.deleteCoordinatorInvite(id);
++  res.json({ message: 'Invite record deleted.' });
++}));
++
+ // ── Super Admin: Active Accounts tab — list + search across roles ──
+ // AUTH-16: Coordinator has read-only access to all user profiles — so these
+ // two GET routes allow COORDINATOR too, while every mutation below (verify,
+diff --git a/server/src/features/auth/service.ts b/server/src/features/auth/service.ts
+index 24bd796..78ba2ff 100644
+--- a/server/src/features/auth/service.ts
++++ b/server/src/features/auth/service.ts
+@@ -9,7 +9,7 @@ import bcrypt from 'bcryptjs';
+ import { sql } from 'kysely';
+ import { db, isPgError, type UserRole } from '../../db/index.js';
+ import { config } from '../../config/index.js';
+-import { generateToken, hashToken } from '../../lib/tokens.js';
++import { generateToken, hashToken, generateOtp, hashOtp } from '../../lib/tokens.js';
+ import { sendEmail } from '../../lib/email.js';
+ import { notify } from '../notifications/service.js';
+ import { signAccessToken } from '../../middleware/auth.js';
+@@ -261,6 +261,7 @@ export async function logout(rawToken: string | undefined): Promise<void> {
+ const RESET_RATE_LIMIT_WINDOW_MIN = 15;
+ const RESET_RATE_LIMIT_PER_EMAIL = 3; // per 15-minute window
+ const RESET_RATE_LIMIT_PER_IP = 10; // per 15-minute window, across any emails
++const OTP_MAX_ATTEMPTS = 5; // wrong-guess limit on a single issued code
+ 
+ // Kysely's typed builder chokes on `>=` comparisons against this table's
+ // Generated<Timestamp> column (a pre-existing quirk — the same thing fails
+@@ -275,17 +276,69 @@ async function countRecentAttempts(field: 'email_attempted' | 'ip_address', valu
+   return Number(rows.rows[0]?.n ?? 0);
+ }
+ 
+-// AUTH-17 hardening: rate-limited (shares the reset-attempt counter — a
+-// burst of failed "current password" guesses and a burst of forgot-password
+-// requests are both attacks on the same account, so one shared per-account
+-// limit covers both) and alerts the account holder on every successful
+-// change, same as a reset. What this deliberately does NOT become is an
+-// email-link flow: AUTH-17 is explicit that a logged-in user changes their
+-// own password by providing their current one — that's a different, already
+-// -authenticated identity proof than "prove you own this inbox" (which is
+-// what the token-and-link machinery in requestPasswordReset exists for).
+-export async function changePassword(userId: string, currentPassword: string, newPassword: string, ip?: string): Promise<void> {
+-  const user = await db.selectFrom('app_user').select(['password_hash', 'email', 'full_name'])
++// Issues an OTP for the given purpose, invalidating any earlier still-live
++// code of the SAME purpose for that user first (AUTH-21: "only the latest
++// code works"). Shared by both the forgot-password and change-password-
++// confirmation flows — same security shape, different context.
++async function issueOtp(userId: string, purpose: 'RESET' | 'CHANGE_CONFIRM'): Promise<string> {
++  await db.updateTable('password_reset_token')
++    .set({ used_at: sql<Date>`now()` })
++    .where('user_id', '=', userId).where('purpose', '=', purpose).where('used_at', 'is', null)
++    .execute();
++
++  const otp = generateOtp();
++  // AUTH-21: 15 minutes, single-use. expires_at is derived from the DB's own
++  // now() in the same row (the table's CHECK requires it) so app/DB clock
++  // skew can't matter.
++  await db.insertInto('password_reset_token')
++    .values({
++      user_id: userId,
++      token_hash: hashOtp(otp),
++      purpose,
++      expires_at: sql<Date>`now() + interval '15 minutes'`,
++    })
++    .execute();
++  return otp;
++}
++
++// Verifies an OTP for the given purpose against the newest issued code for
++// that user, with a wrong-guess limit independent of the request-issuing
++// rate limit — an 8-digit code has far less entropy than the old 256-bit
++// token, so guessing needs its own ceiling per issued code, not just a cap
++// on how many codes get sent. A burned/exceeded code requires a fresh
++// request; that's intentional, not a bug.
++async function verifyOtp(userId: string, purpose: 'RESET' | 'CHANGE_CONFIRM', otp: string): Promise<void> {
++  const tok = await db.selectFrom('password_reset_token')
++    .select(['token_id', 'token_hash', 'expires_at', 'used_at', 'failed_attempts'])
++    .where('user_id', '=', userId).where('purpose', '=', purpose)
++    .where('used_at', 'is', null)
++    .orderBy('issued_at', 'desc')
++    .executeTakeFirst();
++
++  if (!tok || new Date(tok.expires_at) < new Date() || tok.failed_attempts >= OTP_MAX_ATTEMPTS) {
++    throw badRequest('This code is invalid or has expired. Request a new one.');
++  }
++  if (tok.token_hash !== hashOtp(otp)) {
++    await db.updateTable('password_reset_token').set({ failed_attempts: tok.failed_attempts + 1 })
++      .where('token_id', '=', tok.token_id).execute();
++    throw badRequest('This code is invalid or has expired. Request a new one.');
++  }
++  await db.updateTable('password_reset_token').set({ used_at: sql<Date>`now()` })
++    .where('token_id', '=', tok.token_id).execute();
++}
++
++async function alertPasswordChanged(email: string, fullName: string): Promise<void> {
++  await sendEmail({
++    to: email,
++    subject: 'Your BUKC Sports password was changed',
++    html: `<p>Hello ${fullName}, your password was just changed. If this wasn't you, contact the sports office immediately.</p>`,
++    text: `Hello ${fullName}, your password was just changed. If this wasn't you, contact the sports office immediately.`,
++  }).catch((e) => console.error('password-changed alert email failed:', e));
++}
++
++// ── AUTH-17, step 1: verify current password, then email an OTP to confirm ──
++export async function requestChangePasswordOtp(userId: string, currentPassword: string, ip?: string): Promise<{ devOtp?: string }> {
++  const user = await db.selectFrom('app_user').select(['password_hash', 'email'])
+     .where('user_id', '=', userId).executeTakeFirst();
+   if (!user) throw notFound('User not found');
+ 
+@@ -296,111 +349,85 @@ export async function changePassword(userId: string, currentPassword: string, ne
+     throw conflict('Too many password attempts on this account. Try again in a few minutes.', 'RATE_LIMITED');
+   }
+ 
+-  // AUTH-17: must provide current password
+   const ok = await bcrypt.compare(currentPassword, user.password_hash);
+   if (!ok) throw badRequest('Current password is incorrect');
+ 
++  const otp = await issueOtp(userId, 'CHANGE_CONFIRM');
++  await sendEmail({
++    to: user.email,
++    subject: 'Confirm your BUKC Sports password change',
++    html: `<p>Here is your confirmation code:</p><p style="font-size:24px;font-weight:700;letter-spacing:2px;">${otp}</p><p>This code expires in 15 minutes and can only be used once. If you didn't request this, you can ignore it — your password won't change without it.</p>`,
++    text: `Your confirmation code: ${otp} (expires in 15 minutes, single use)`,
++  }).catch((e) => console.error('change-otp email failed:', e));
++
++  // Same dev-mode convenience as inviteCoordinator's devToken — never exposed
++  // in production, since EMAIL_PROVIDER=console can't be inspected by a test/
++  // dev client the way a real inbox can.
++  return config.NODE_ENV === 'production' ? {} : { devOtp: otp };
++}
++
++// ── AUTH-17, step 2: confirm with the emailed OTP, actually change it ──
++export async function confirmChangePassword(userId: string, otp: string, newPassword: string): Promise<void> {
++  await verifyOtp(userId, 'CHANGE_CONFIRM', otp);
++
++  const user = await db.selectFrom('app_user').select(['email', 'full_name'])
++    .where('user_id', '=', userId).executeTakeFirstOrThrow();
+   const hash = await bcrypt.hash(newPassword, config.BCRYPT_ROUNDS);
+-  await db.updateTable('app_user').set({ password_hash: hash })
+-    .where('user_id', '=', userId).execute();
++  await db.updateTable('app_user').set({ password_hash: hash }).where('user_id', '=', userId).execute();
+ 
+   // AUTH-10 spirit: invalidate existing sessions on password change
+   await db.updateTable('refresh_token').set({ revoked_at: new Date() })
+     .where('user_id', '=', userId).where('revoked_at', 'is', null).execute();
+ 
+-  // Log and alert — same as a reset, the account holder is told their
+-  // password changed so they can react fast if it wasn't really them.
+-  await sendEmail({
+-    to: user.email,
+-    subject: 'Your BUKC Sports password was changed',
+-    html: `<p>Hello ${user.full_name}, your password was just changed. If this wasn't you, contact the sports office immediately.</p>`,
+-    text: `Hello ${user.full_name}, your password was just changed. If this wasn't you, contact the sports office immediately.`,
+-  }).catch((e) => console.error('change-password confirmation email failed:', e));
++  await alertPasswordChanged(user.email, user.full_name);
+ }
+ 
+-/** AUTH-18: send a reset link. Always returns success (don't reveal if email exists). */
+-
+-export async function requestPasswordReset(email: string, origin: string, ip?: string): Promise<void> {
++// ── AUTH-18, step 1: email an OTP (not a link — see migration 018). Always
++// returns success; never reveals whether the email exists. ──
++export async function requestPasswordReset(email: string, ip?: string): Promise<{ devOtp?: string }> {
+   // Log the attempt unconditionally — this is pure rate-limit bookkeeping,
+   // never exposed to the caller, so it can't leak whether the email exists.
+   await db.insertInto('password_reset_attempt')
+     .values({ email_attempted: email, ip_address: ip ?? null }).execute();
+ 
+   const emailCount = await countRecentAttempts('email_attempted', email, RESET_RATE_LIMIT_WINDOW_MIN);
+-  if (emailCount > RESET_RATE_LIMIT_PER_EMAIL) return; // rate-limited — same silent return as "no such account"
++  if (emailCount > RESET_RATE_LIMIT_PER_EMAIL) return {}; // rate-limited — same silent return as "no such account"
+ 
+   if (ip) {
+     const ipCount = await countRecentAttempts('ip_address', ip, RESET_RATE_LIMIT_WINDOW_MIN);
+-    if (ipCount > RESET_RATE_LIMIT_PER_IP) return;
++    if (ipCount > RESET_RATE_LIMIT_PER_IP) return {};
+   }
+ 
+   const user = await db.selectFrom('app_user').select(['user_id']).where('email', '=', email).executeTakeFirst();
+-  if (!user) return; // silent — no account enumeration
+-
+-  // AUTH-21: "only the latest link works" — invalidate any still-live tokens
+-  // from earlier requests before issuing a new one, by marking them used.
+-  await db.updateTable('password_reset_token')
+-    .set({ used_at: sql<Date>`now()` })
+-    .where('user_id', '=', user.user_id).where('used_at', 'is', null)
+-    .execute();
++  if (!user) return {}; // silent — no account enumeration
+ 
+-  const raw = generateToken();
+-  // AUTH-21: the token expires in 15 minutes and is single-use. The table has a
+-  // CHECK (expires_at = issued_at + interval '15 minutes'), and issued_at defaults
+-  // to now() ON THE DB. We must therefore derive expires_at from the DB's own
+-  // now() in the same row — computing it in JS would fail the CHECK on any clock
+-  // skew between app and database. Express it as SQL so both sides use DB time.
+-  await db.insertInto('password_reset_token')
+-    .values({
+-      user_id: user.user_id,
+-      token_hash: hashToken(raw),
+-      expires_at: sql<Date>`now() + interval '15 minutes'`,
+-    })
+-    .execute();
+-
+-  const link = `${origin}/reset-password?token=${raw}`;
++  const otp = await issueOtp(user.user_id, 'RESET');
+   await sendEmail({
+     to: email,
+-    subject: 'Reset your BUKC Sports password',
+-    html: `<p>Reset your password using the link below. It expires in 15 minutes and can be used once.</p><p><a href="${link}">Reset password</a></p>`,
+-    text: `Reset your password (expires in 15 minutes, single use): ${link}`,
+-  }).catch((e) => console.error('reset email failed:', e)); // NOTIF-03 best-effort
+-}
++    subject: 'Your BUKC Sports password reset code',
++    html: `<p>Here is your password reset code:</p><p style="font-size:24px;font-weight:700;letter-spacing:2px;">${otp}</p><p>This code expires in 15 minutes and can only be used once. If you didn't request this, you can ignore it.</p>`,
++    text: `Your password reset code: ${otp} (expires in 15 minutes, single use)`,
++  }).catch((e) => console.error('reset-otp email failed:', e)); // NOTIF-03 best-effort
+ 
+-/** AUTH-21: consume a single-use, 15-min token. */
+-export async function resetPassword(rawToken: string, newPassword: string): Promise<void> {
+-  const tokenHash = hashToken(rawToken);
+-  const hash = await bcrypt.hash(newPassword, config.BCRYPT_ROUNDS);
++  return config.NODE_ENV === 'production' ? {} : { devOtp: otp };
++}
+ 
+-  const changed = await db.transaction().execute(async (trx) => {
+-    const tok = await trx.selectFrom('password_reset_token')
+-      .select(['token_id', 'user_id', 'expires_at', 'used_at'])
+-      .where('token_hash', '=', tokenHash)
+-      .executeTakeFirst();
++// ── AUTH-18, step 2: consume the OTP, set the new password ──
++export async function resetPassword(email: string, otp: string, newPassword: string): Promise<void> {
++  const user = await db.selectFrom('app_user').select(['user_id', 'full_name']).where('email', '=', email).executeTakeFirst();
++  // Same generic error whether the email is unknown or the code is wrong —
++  // no enumeration signal from this endpoint either.
++  if (!user) throw badRequest('This code is invalid or has expired. Request a new one.');
+ 
+-    if (!tok || tok.used_at || new Date(tok.expires_at) < new Date()) {
+-      throw badRequest('This reset link is invalid or has expired.');
+-    }
+-    await trx.updateTable('password_reset_token').set({ used_at: new Date() })
+-      .where('token_id', '=', tok.token_id).execute();
+-    await trx.updateTable('app_user').set({ password_hash: hash })
+-      .where('user_id', '=', tok.user_id).execute();
+-    // invalidate ALL sessions on a completed reset
+-    await trx.updateTable('refresh_token').set({ revoked_at: new Date() })
+-      .where('user_id', '=', tok.user_id).where('revoked_at', 'is', null).execute();
++  await verifyOtp(user.user_id, 'RESET', otp);
+ 
+-    return trx.selectFrom('app_user').select(['email', 'full_name']).where('user_id', '=', tok.user_id).executeTakeFirstOrThrow();
+-  });
++  const hash = await bcrypt.hash(newPassword, config.BCRYPT_ROUNDS);
++  await db.updateTable('app_user').set({ password_hash: hash }).where('user_id', '=', user.user_id).execute();
++  // invalidate ALL sessions on a completed reset
++  await db.updateTable('refresh_token').set({ revoked_at: new Date() })
++    .where('user_id', '=', user.user_id).where('revoked_at', 'is', null).execute();
+ 
+-  // Log and alert: the account holder is told their password changed, even
+-  // though they're the one who just did it — this is what lets them notice
+-  // and react fast if it genuinely wasn't them (a stolen reset link, etc).
+-  await sendEmail({
+-    to: changed.email,
+-    subject: 'Your BUKC Sports password was changed',
+-    html: `<p>Hello ${changed.full_name}, your password was just reset. If this wasn't you, contact the sports office immediately.</p>`,
+-    text: `Hello ${changed.full_name}, your password was just reset. If this wasn't you, contact the sports office immediately.`,
+-  }).catch((e) => console.error('reset confirmation email failed:', e));
++  await alertPasswordChanged(email, user.full_name);
+ }
+ 
+ // ── Super Admin: verify accounts (AUTH-04/20) ──
+@@ -494,6 +521,17 @@ export async function listCoordinatorInvites(): Promise<CoordinatorInviteRecord[
+   });
+ }
+ 
++// Hard delete — nothing else in the schema references coordinator_invite
++// (unlike app_user, which is why THAT needs the soft-delete dance instead).
++// Deleting the invite record here doesn't touch the invited user's account
++// at all, whether they accepted, are still pending, or the invite expired
++// unused — this is purely trimming the audit log itself.
++export async function deleteCoordinatorInvite(inviteId: string): Promise<void> {
++  const res = await db.deleteFrom('coordinator_invite')
++    .where('invite_id', '=', inviteId).executeTakeFirst();
++  if (!res.numDeletedRows) throw notFound('Invite not found.');
++}
++
+ // ── Active Accounts tab: list + search across all three self/invited roles ──
+ 
+ export interface ManagedAccount {
+diff --git a/server/src/features/auth/validators.ts b/server/src/features/auth/validators.ts
+index 091f746..f4b90ce 100644
+--- a/server/src/features/auth/validators.ts
++++ b/server/src/features/auth/validators.ts
+@@ -93,8 +93,13 @@ export const rejectAccountSchema = z.object({
+   reason: z.string().min(3, 'Give a brief reason').max(500),
+ });
+ 
+-export const changePasswordSchema = z.object({
++const otpSchema = z.string().regex(/^\d{8}$/, 'Enter the 8-digit code from your email');
++
++export const requestChangeOtpSchema = z.object({
+   currentPassword: z.string().min(1),
++});
++export const confirmChangePasswordSchema = z.object({
++  otp: otpSchema,
+   newPassword: passwordSchema,
+ });
+ 
+@@ -103,7 +108,8 @@ export const forgotPasswordSchema = z.object({
+ });
+ 
+ export const resetPasswordSchema = z.object({
+-  token: z.string().min(10),
++  email: z.string().email(),
++  otp: otpSchema,
+   newPassword: passwordSchema,
+ });
+ 
+diff --git a/server/src/lib/tokens.ts b/server/src/lib/tokens.ts
+index 6fb1391..545ec74 100644
+--- a/server/src/lib/tokens.ts
++++ b/server/src/lib/tokens.ts
+@@ -3,7 +3,8 @@
+  * (AUTH-08 spirit) — a leaked DB dump must not yield usable tokens. The raw
+  * token goes to the user (cookie / email link); the hash goes to the DB.
+  */
+-import { randomBytes, createHash } from 'node:crypto';
++import { randomBytes, randomInt, createHash, createHmac } from 'node:crypto';
++import { config } from '../config/index.js';
+ 
+ /** A URL-safe random token to hand to the user. */
+ export function generateToken(bytes = 32): string {
+@@ -14,3 +15,21 @@ export function generateToken(bytes = 32): string {
+ export function hashToken(token: string): string {
+   return createHash('sha256').update(token).digest('hex');
+ }
++
++/** A crypto-secure random N-digit numeric OTP (default 8 digits, e.g. "53589691"). */
++export function generateOtp(digits = 8): string {
++  const min = 10 ** (digits - 1);
++  const max = 10 ** digits; // exclusive upper bound
++  return String(randomInt(min, max));
++}
++
++/**
++ * OTPs get an HMAC, not the plain SHA-256 used for high-entropy tokens above.
++ * An 8-digit code has ~26.6 bits of entropy — a DB dump alone would let an
++ * attacker exhaustively hash and match every possible code in well under a
++ * second. Keying the hash with the server secret means the dump alone isn't
++ * enough; they'd also need that secret.
++ */
++export function hashOtp(otp: string): string {
++  return createHmac('sha256', config.JWT_ACCESS_SECRET).update(otp).digest('hex');
++}
+diff --git a/server/tests/auth.test.ts b/server/tests/auth.test.ts
+index e85433f..a7fb41b 100644
+--- a/server/tests/auth.test.ts
++++ b/server/tests/auth.test.ts
+@@ -40,6 +40,7 @@ async function superAdminAgent() {
+   const authed = {
+     get: (url: string) => agent.get(url).set(bearer),
+     post: (url: string) => agent.post(url).set(bearer),
++    delete: (url: string) => agent.delete(url).set(bearer),
+   };
+   return { agent: authed, token, raw: agent };
+ }
+@@ -322,7 +323,7 @@ describe('Coordinator invite flow (AUTH-06)', () => {
+ });
+ 
+ // ═══════════════════════════════ PASSWORD RESET (AUTH-17/18/21) ═══════════════════════════════
+-describe('Password reset (AUTH-17/18/21)', () => {
++describe('Password reset (AUTH-17/18/21, OTP-based)', () => {
+   it('T-122 AUTH-18: forgot-password always returns success (no enumeration)', async () => {
+     const known = await request(app).post('/api/auth/forgot-password').send({ email: seedCreds.email });
+     const unknown = await request(app).post('/api/auth/forgot-password').send({ email: 'ghost@bukc.edu.pk' });
+@@ -331,49 +332,96 @@ describe('Password reset (AUTH-17/18/21)', () => {
+     expect(known.body.message).toBe(unknown.body.message);
+   });
+ 
+-  it('T-123 AUTH-21: reset with an invalid token is rejected', async () => {
+-    const res = await request(app).post('/api/auth/reset-password').send({ token: 'invalid-token-string', newPassword: 'NewPass123' });
+-    expect(res.status).toBe(400);
++  it('T-123 AUTH-21: reset with a wrong code for a real email is rejected, same generic message as an unknown email', async () => {
++    const email = uniqueEmail('badotp');
++    await registerStudent({ email });
++    await request(app).post('/api/auth/forgot-password').send({ email });
++
++    const wrongCode = await request(app).post('/api/auth/reset-password').send({ email, otp: '11111111', newPassword: 'NewPass123' });
++    const unknownEmail = await request(app).post('/api/auth/reset-password').send({ email: 'ghost@bukc.edu.pk', otp: '11111111', newPassword: 'NewPass123' });
++    expect(wrongCode.status).toBe(400);
++    expect(unknownEmail.status).toBe(400);
++    expect(wrongCode.body.error).toBe(unknownEmail.body.error);
+   });
+ 
+-  it('T-124 AUTH-17: change-password requires the correct current password', async () => {
++  it('T-123b AUTH-18/21: the full OTP reset flow works end-to-end with the real code', async () => {
++    const { agent } = await superAdminAgent();
++    const email = uniqueEmail('realotp');
++    const oldPassword = 'OldPassword1';
++    const reg = await registerStudent({ email, password: oldPassword });
++    await agent.post('/api/auth/admin/verify').send({ userId: reg.body.user.userId });
++
++    const req1 = await request(app).post('/api/auth/forgot-password').send({ email });
++    const otp = req1.body.devOtp as string;
++    expect(otp).toMatch(/^\d{8}$/);
++
++    const res = await request(app).post('/api/auth/reset-password').send({ email, otp, newPassword: 'BrandNew1' });
++    expect(res.status).toBe(200);
++
++    const relogin = await loginAs(email, 'BrandNew1');
++    expect(relogin.status).toBe(200);
++  });
++
++  it('T-124 AUTH-17: change-password step 1 requires the correct current password', async () => {
+     const { token } = await superAdminAgent();
+-    const res = await request(app).post('/api/auth/change-password')
++    const res = await request(app).post('/api/auth/change-password/request-otp')
+       .set('Authorization', `Bearer ${token}`)
+-      .send({ currentPassword: 'WrongCurrent', newPassword: 'BrandNewPass1' });
++      .send({ currentPassword: 'WrongCurrent' });
+     expect(res.status).toBe(400);
+     expect(res.body.error).toMatch(/current password/i);
+   });
+ 
+-  it('T-125 AUTH-17: change-password succeeds with the correct current password', async () => {
++  it('T-125 AUTH-17: change-password succeeds end-to-end — request OTP, confirm, old password dead', async () => {
+     const { token } = await superAdminAgent();
+-    const res = await request(app).post('/api/auth/change-password')
++    const step1 = await request(app).post('/api/auth/change-password/request-otp')
+       .set('Authorization', `Bearer ${token}`)
+-      .send({ currentPassword: seedCreds.password, newPassword: 'BrandNewPass1' });
+-    expect(res.status).toBe(200);
++      .send({ currentPassword: seedCreds.password });
++    expect(step1.status).toBe(200);
++    const otp = step1.body.devOtp as string;
++    expect(otp).toMatch(/^\d{8}$/);
++
++    const step2 = await request(app).post('/api/auth/change-password/confirm')
++      .set('Authorization', `Bearer ${token}`)
++      .send({ otp, newPassword: 'BrandNewPass1' });
++    expect(step2.status).toBe(200);
++
+     // old password no longer works
+     const relogin = await loginAs(seedCreds.email, seedCreds.password);
+     expect(relogin.status).toBe(401);
+   });
+ 
+-  it('T-125b AUTH-21: requesting a new reset invalidates the previous unused token — only the latest link works', async () => {
++  it('T-125a: confirming with a wrong OTP is rejected and does not change the password', async () => {
++    const email = uniqueEmail('wrongconfirm');
++    const password = 'StartPass1';
++    const { agent } = await superAdminAgent();
++    const reg = await registerStudent({ email, password });
++    await agent.post('/api/auth/admin/verify').send({ userId: reg.body.user.userId });
++    const login = await loginAs(email, password);
++    const bearer = { Authorization: `Bearer ${login.body.accessToken}` };
++
++    await request(app).post('/api/auth/change-password/request-otp').set(bearer).send({ currentPassword: password });
++    const res = await request(app).post('/api/auth/change-password/confirm').set(bearer).send({ otp: '00000000', newPassword: 'NewPass1' });
++    expect(res.status).toBe(400);
++
++    const stillOld = await loginAs(email, password);
++    expect(stillOld.status).toBe(200);
++  });
++
++  it('T-125b AUTH-21: requesting a new code invalidates the previous unused one — only the latest code works', async () => {
+     const email = uniqueEmail('resetflow');
+     await registerStudent({ email });
+ 
+-    await request(app).post('/api/auth/forgot-password').send({ email });
+-    const firstToken = await db.selectFrom('password_reset_token')
+-      .innerJoin('app_user', 'app_user.user_id', 'password_reset_token.user_id')
+-      .select('password_reset_token.token_id')
+-      .where('app_user.email', '=', email).executeTakeFirstOrThrow();
++    const req1 = await request(app).post('/api/auth/forgot-password').send({ email });
++    const firstOtp = req1.body.devOtp as string;
+ 
+     await request(app).post('/api/auth/forgot-password').send({ email });
+ 
+-    const first = await db.selectFrom('password_reset_token').select('used_at')
+-      .where('token_id', '=', firstToken.token_id).executeTakeFirst();
+-    expect(first?.used_at).not.toBeNull(); // invalidated by the second request
++    // the first code, still unused a moment ago, is now dead
++    const res = await request(app).post('/api/auth/reset-password').send({ email, otp: firstOtp, newPassword: 'Whatever1' });
++    expect(res.status).toBe(400);
+   });
+ 
+-  it('T-125c AUTH-21: more than 3 reset requests for the same email in the window are silently rate-limited (no new token issued)', async () => {
++  it('T-125c AUTH-21: more than 3 reset requests for the same email in the window are silently rate-limited (no new code issued)', async () => {
+     const email = uniqueEmail('ratelimit');
+     await registerStudent({ email });
+ 
+@@ -381,17 +429,9 @@ describe('Password reset (AUTH-17/18/21)', () => {
+       const res = await request(app).post('/api/auth/forgot-password').send({ email });
+       expect(res.status).toBe(200); // always the same generic response
+     }
+-    const beforeExtra = await db.selectFrom('password_reset_token')
+-      .innerJoin('app_user', 'app_user.user_id', 'password_reset_token.user_id')
+-      .select(db.fn.countAll().as('n')).where('app_user.email', '=', email).executeTakeFirst();
+-
+     const res4 = await request(app).post('/api/auth/forgot-password').send({ email });
+     expect(res4.status).toBe(200); // still the same generic response — no signal either way
+-
+-    const afterExtra = await db.selectFrom('password_reset_token')
+-      .innerJoin('app_user', 'app_user.user_id', 'password_reset_token.user_id')
+-      .select(db.fn.countAll().as('n')).where('app_user.email', '=', email).executeTakeFirst();
+-    expect(Number(afterExtra?.n)).toBe(Number(beforeExtra?.n)); // the 4th request issued no new token
++    expect(res4.body.devOtp).toBeUndefined(); // rate-limited — no code was actually issued
+   });
+ 
+   it('T-125d: a completed reset invalidates every session, not just the one that requested it', async () => {
+@@ -403,18 +443,31 @@ describe('Password reset (AUTH-17/18/21)', () => {
+     const login = await loginAs(email, password);
+     expect(login.status).toBe(200);
+ 
+-    await request(app).post('/api/auth/forgot-password').send({ email });
+-    const tok = await db.selectFrom('password_reset_token')
+-      .innerJoin('app_user', 'app_user.user_id', 'password_reset_token.user_id')
+-      .select('password_reset_token.token_hash').where('app_user.email', '=', email).executeTakeFirstOrThrow();
+-    // the raw token isn't recoverable from its hash in a test — exercise the
+-    // DB-level session-kill guarantee directly instead, which is what the
+-    // route actually depends on regardless of how the token was obtained.
++    const req1 = await request(app).post('/api/auth/forgot-password').send({ email });
++    await request(app).post('/api/auth/reset-password').send({ email, otp: req1.body.devOtp, newPassword: 'FreshPass1' });
++
+     const openSessions = await db.selectFrom('refresh_token')
+       .innerJoin('app_user', 'app_user.user_id', 'refresh_token.user_id')
+       .select('refresh_token.token_id').where('app_user.email', '=', email).where('refresh_token.revoked_at', 'is', null).execute();
+-    expect(openSessions.length).toBeGreaterThan(0);
+-    void tok;
++    expect(openSessions.length).toBe(0); // the pre-reset session was killed; no new one has logged in yet
++  });
++
++  it('T-125e AUTH-21: five wrong OTP guesses burn the code — the sixth attempt fails even if it happens to be correct', async () => {
++    const email = uniqueEmail('bruteforce');
++    await registerStudent({ email });
++    const req1 = await request(app).post('/api/auth/forgot-password').send({ email });
++    const realOtp = req1.body.devOtp as string;
++
++    for (let i = 0; i < 5; i++) {
++      // a validly-formatted (but wrong) password — an invalid format would
++      // fail schema validation before ever reaching the OTP check at all,
++      // which would make this loop test nothing.
++      const res = await request(app).post('/api/auth/reset-password').send({ email, otp: '99999999', newPassword: 'WrongGuess1' });
++      expect(res.status).toBe(400);
++    }
++    // the code is now burned regardless of correctness
++    const finalTry = await request(app).post('/api/auth/reset-password').send({ email, otp: realOtp, newPassword: 'ValidPass1' });
++    expect(finalTry.status).toBe(400);
+   });
+ });
+ 
+@@ -452,6 +505,64 @@ describe('Coordinator invite — validation and audit trail', () => {
+     const res = await request(app).get('/api/auth/admin/coordinator-invites');
+     expect(res.status).toBe(401);
+   });
++
++  it('T-125h: a super admin can hard-delete a coordinator invite record', async () => {
++    const { agent } = await superAdminAgent();
++    const email = uniqueEmail('deleteinvite');
++    const inv = await agent.post('/api/auth/admin/invite-coordinator').send({
++      fullName: 'To Be Deleted', email, contactNumber: '03001112222',
++    });
++    void inv;
++
++    const before = await agent.get('/api/auth/admin/coordinator-invites');
++    const entry = before.body.invites.find((i: { email: string }) => i.email === email);
++    expect(entry).toBeTruthy();
++
++    const del = await agent.delete(`/api/auth/admin/coordinator-invites/${entry.inviteId}`);
++    expect(del.status).toBe(200);
++
++    const after = await agent.get('/api/auth/admin/coordinator-invites');
++    expect(after.body.invites.find((i: { email: string }) => i.email === email)).toBeUndefined();
++
++    // this is a genuine hard delete — confirm the row is actually gone, not soft-flagged
++    const row = await db.selectFrom('coordinator_invite').select('invite_id')
++      .where('invite_id', '=', entry.inviteId).executeTakeFirst();
++    expect(row).toBeUndefined();
++  });
++
++  it('T-125i: deleting the invite record does not affect an already-accepted coordinator\'s account', async () => {
++    const { agent } = await superAdminAgent();
++    const email = uniqueEmail('deleteafterAccept');
++    const inv = await agent.post('/api/auth/admin/invite-coordinator').send({
++      fullName: 'Accepted Coord', email, contactNumber: '03001112222',
++    });
++    const token = inv.body.devToken as string;
++    await request(app).post('/api/auth/accept-invite').send({ token, password: 'CoordPass1' });
++
++    const list = await agent.get('/api/auth/admin/coordinator-invites');
++    const entry = list.body.invites.find((i: { email: string }) => i.email === email);
++    expect(entry.status).toBe('ACCEPTED');
++
++    await agent.delete(`/api/auth/admin/coordinator-invites/${entry.inviteId}`);
++
++    // the coordinator's actual account is untouched — they can still log in
++    const login = await loginAs(email, 'CoordPass1');
++    expect(login.status).toBe(200);
++  });
++
++  it('T-125j: a non-super-admin cannot delete a coordinator invite record', async () => {
++    const { agent } = await superAdminAgent();
++    const email = uniqueEmail('nodelete');
++    const inv = await agent.post('/api/auth/admin/invite-coordinator').send({
++      fullName: 'No Delete', email, contactNumber: '03001112222',
++    });
++    const list = await agent.get('/api/auth/admin/coordinator-invites');
++    const entry = list.body.invites.find((i: { email: string }) => i.email === email);
++    void inv;
++
++    const res = await request(app).delete(`/api/auth/admin/coordinator-invites/${entry.inviteId}`);
++    expect(res.status).toBe(401);
++  });
+ });
+ 
+ // ═══════════════════════════════ STUDENT LOGIN BY ENROLLMENT (AUTH-01) ═══════════════════════════════
+-- 
+2.43.0
+

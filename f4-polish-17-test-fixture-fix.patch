@@ -1,0 +1,74 @@
+From 6cebcfece06f3308f73781d890e51296fa6c3ab6 Mon Sep 17 00:00:00 2001
+From: Raza <raza@bukc.edu.pk>
+Date: Thu, 30 Jul 2026 09:17:31 +0000
+Subject: [PATCH] fix(tests): borrow.test.ts fixture collision with real
+ max-duration enforcement
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Regression in the borrow-polish patch's own test suite, caught during a
+full independent-clone verification pass (12 of 154 tests failed, far
+beyond the usual single pre-existing timezone flake).
+
+Root cause: makeSingleType() defaulted maxBorrowDurationMinutes to 120
+(2h), while the shared todayWindow() fixture produces a 3-hour window.
+Once submitRequest started actually enforcing that limit, every
+pre-existing test combining the two fixtures failed at the very first
+'submit request' step with a 400 — cascading through everything
+downstream that depended on a successful submission (approve, lend,
+return, overdue detection...). T-616/T-617 (the two tests that
+specifically exercise the 120-minute boundary) happened to rely on that
+same shared default implicitly, which is what let this slip through
+initially.
+
+Fix: maxBorrowDurationMinutes is now an explicit optional parameter on
+makeSingleType (default 480/8h — comfortably clear of the 3-hour test
+window used everywhere else), and T-616/T-617 now pass 120 explicitly
+instead of depending on an implicit shared default.
+
+Verified on a fully independent fresh clone (origin/main + the
+borrow-polish patch + this fix): full suite, all 7 files, 154/154 tests
+pass.
+---
+ server/tests/borrow.test.ts | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/server/tests/borrow.test.ts b/server/tests/borrow.test.ts
+index aa4c58f..a6861bf 100644
+--- a/server/tests/borrow.test.ts
++++ b/server/tests/borrow.test.ts
+@@ -70,10 +70,10 @@ async function firstSportId(): Promise<number> {
+   return c.sport_category_id;
+ }
+ 
+-async function makeSingleType(staff: Awaited<ReturnType<typeof staffAgent>>, name = 'Football') {
++async function makeSingleType(staff: Awaited<ReturnType<typeof staffAgent>>, name = 'Football', maxBorrowDurationMinutes = 480) {
+   const res = await staff.post('/api/inventory/types').send({
+     sportCategoryId: await firstSportId(), name, lendingUnit: 'SINGLE',
+-    lowStockThreshold: 1, maxBorrowDurationMinutes: 120,
++    lowStockThreshold: 1, maxBorrowDurationMinutes,
+     conditionGoodMinScore: 70, conditionWornMinScore: 40, isIndoor: false,
+   });
+   return res.body.type.equipmentTypeId as number;
+@@ -342,7 +342,7 @@ describe('Overdue detection (BORROW-18)', () => {
+ describe('Borrow polish fixes', () => {
+   it('T-616: submitRequest rejects when requested window exceeds max_borrow_duration_minutes', async () => {
+     const stu = await studentAgent(staff);
+-    const typeId = await makeSingleType(staff, 'Short Loan Racket'); // maxBorrowDurationMinutes = 120 (2h)
++    const typeId = await makeSingleType(staff, 'Short Loan Racket', 120); // explicit 2h limit for this test
+     await addArticle(staff, typeId, bc(220));
+     // Request a 3-hour window — exceeds the 2h max.
+     const start = new Date(); start.setHours(10, 0, 0, 0);
+@@ -356,7 +356,7 @@ describe('Borrow polish fixes', () => {
+ 
+   it('T-617: submitRequest succeeds when requested window equals max_borrow_duration_minutes', async () => {
+     const stu = await studentAgent(staff);
+-    const typeId = await makeSingleType(staff, 'Exact Fit Racket'); // 120 min
++    const typeId = await makeSingleType(staff, 'Exact Fit Racket', 120); // explicit 2h limit for this test
+     await addArticle(staff, typeId, bc(221));
+     // Request exactly 2 hours — should succeed.
+     const start = new Date(); start.setHours(10, 0, 0, 0);
+-- 
+2.43.0
+
